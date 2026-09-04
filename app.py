@@ -5,29 +5,38 @@ from scipy.signal import butter, filtfilt, hilbert, find_peaks
 import plotly.graph_objects as go
 from datetime import datetime, time, timezone, timedelta
 
-st.set_page_config(page_title="LB Surf", page_icon="🏄", layout="wide")
+st.set_page_config(page_title="lb surf", page_icon="🏄", layout="wide")
 
-# Buoy Stations Catalog
+# Active Southern California Stations (Realtime _xy.nc streams)
 STATIONS = {
-    "092 - San Pedro South": "092",
-    "271 - Green Beach Offshore (Camp Pendleton/San Clemente)": "271",
-    "220 - Mission Bay West (San Diego)": "220",
-    "045 - Oceanside Offshore": "045"
+    "092 - San Pedro South": {"id": "092", "name": "San Pedro South"},
+    "045 - Oceanside Offshore": {"id": "045", "name": "Oceanside Offshore"},
+    "220 - Mission Bay West": {"id": "220", "name": "Mission Bay West"},
+    "100 - Torrey Pines Outer": {"id": "100", "name": "Torrey Pines Outer"},
+    "153 - Imperial Beach Nearshore": {"id": "153", "name": "Imperial Beach Nearshore"},
+    "241 - Del Mar Nearshore": {"id": "241", "name": "Del Mar Nearshore"},
+    "028 - San Pedro": {"id": "028", "name": "San Pedro (Outer Shelf)"},
+    "215 - Santa Monica Bay": {"id": "215", "name": "Santa Monica Bay"},
+    "111 - San Pedro Channel": {"id": "111", "name": "San Pedro Channel"},
+    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer"},
+    "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf"}
 }
 
-# Top Station Selection & Refresh
-col_top1, col_top2 = st.columns([2, 1])
+# Top Station Selection & Controls
+col_top1, col_top2 = st.columns([3, 1])
 with col_top1:
-    selected_station_label = st.selectbox("Select Station", list(STATIONS.keys()), index=0)
-    station_id = STATIONS[selected_station_label]
+    selected_label = st.selectbox("Select Station", list(STATIONS.keys()), index=0)
+    station_info = STATIONS[selected_label]
+    station_id = station_info["id"]
+    station_name = station_info["name"]
 with col_top2:
     st.write("")
     st.write("")
-    if st.button("🔄 Refresh Data / Clear Cache"):
+    if st.button("🔄 Refresh / Clear Cache"):
         st.cache_data.clear()
         st.rerun()
 
-# Sidebar: Time Window & Swell Filters
+# Sidebar: Time Window & Swell Bands
 with st.sidebar:
     st.header("🕒 Time Window Selection")
     time_mode = st.radio("Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=0)
@@ -59,14 +68,13 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     try:
         ds = xr.open_dataset(url)
     except Exception as e:
-        return None, f"Failed to connect to CDIP OpenDAP endpoint: {e}"
+        return None, f"Failed to connect to CDIP OpenDAP endpoint for Station {station}: {e}"
 
     fs = float(ds.xyzSampleRate.values)
     stride = 2
     eff_fs = fs / stride
     samples_needed = int(hours * 3600 * fs)
 
-    # Determine array indices (Realtime vs Historical Slice)
     total_len = len(ds.xyzZDisplacement)
     
     if end_epoch is None:
@@ -89,7 +97,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         x_raw = ds.xyzXDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
         y_raw = ds.xyzYDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
     except Exception as e:
-        return None, f"Error slicing displacement dataset: {e}"
+        return None, f"Error reading displacement arrays: {e}"
 
     fill_mask = (z_raw < -900) | (x_raw < -900) | (y_raw < -900)
     z_raw[fill_mask] = 0.0
@@ -99,7 +107,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     n_pts = len(z_raw)
     time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-    # 1. Groundswell Decomposition
+    # 1. Groundswell Processing
     b_gs, a_gs = butter(4, [1.0 / p_max, 1.0 / p_min], btype="band", fs=eff_fs)
     z_gs = filtfilt(b_gs, a_gs, z_raw)
     x_gs = filtfilt(b_gs, a_gs, x_raw)
@@ -146,7 +154,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
             "valid": is_valid
         })
 
-    # 2. Windswell Extraction
+    # 2. Windswell Processing
     nyq = eff_fs / 2.0
     high_wind = min(1.0 / wp_min, nyq * 0.95)
     low_wind = 1.0 / wp_max
@@ -195,11 +203,11 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         "wind_summary": wind_summary
     }, None
 
-# UI Header
-st.title("🏄 LB Surf")
-st.caption(f"Station {station_id}")
+# Main Body
+st.title("🏄 lb surf")
+st.markdown(f"### Currently Monitoring: **Buoy {station_id} — {station_name}**")
 
-with st.spinner("Processing 4-hour 3D wave telemetry..."):
+with st.spinner(f"Querying 3D wave telemetry from Buoy {station_id} ({station_name})..."):
     data, err = fetch_and_process_cdip(station_id, selected_end_epoch, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
 
 if err:
@@ -224,7 +232,7 @@ else:
         avg_lull = min_lull = max_lull = avg_set_height = avg_dir = 0.0
 
     # Top Metric Tiles
-    st.subheader("🎯 Primary Groundswell (Target Window)")
+    st.subheader(f"🎯 Primary Groundswell — Buoy {station_id} ({station_name})")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Average Set Lull", f"{avg_lull:.1f} min" if avg_lull > 0 else "N/A")
     m2.metric("Lull Range (Min / Max)", f"{min_lull:.1f} / {max_lull:.1f} min" if avg_lull > 0 else "N/A")
@@ -232,17 +240,17 @@ else:
     delta_tag = "Historical 4.0h Slice" if time_mode == "Historical Lookback" else "Past 4.0 Hours"
     m4.metric("Sets Detected", f"{len(valid_packets)} sets", delta=delta_tag, delta_color="normal")
 
-    # Windswell Indicators
-    st.subheader("💨 Background Windswell Chop Indicator")
+    # Windswell Indicator Tiles
+    st.subheader(f"💨 Background Windswell Chop — Buoy {station_id}")
     w1, w2, w3, w4 = st.columns(4)
     w1.metric("Chop Pulse Spacing", f"{wind['avg_interval_min']:.1f} min" if wind['avg_interval_min'] > 0 else "Continuous")
     w2.metric("Average Chop Height", f"{wind['avg_height_ft']:.1f} ft")
     w3.metric("Peak Chop Spike", f"{wind['max_height_ft']:.1f} ft")
     w4.metric("Mean Chop Direction", f"{wind['avg_direction']:.0f}° True")
 
-    # Set Log Table
+    # Detailed Set Arrival Table
     if valid_packets:
-        st.subheader("📋 Groundswell Set Log")
+        st.subheader(f"📋 Groundswell Set Log for Buoy {station_id} ({station_name})")
         rows = []
         for i, p in enumerate(valid_packets):
             wait = f"{(p['time_min'] - valid_packets[i-1]['time_min']):.1f} min" if i > 0 else "—"
@@ -256,10 +264,10 @@ else:
             })
         st.table(rows)
     else:
-        st.info("No groundswell sets crossed the threshold within your directional window during this 4-hour window.")
+        st.info(f"No groundswell sets crossed the threshold within your directional window on Buoy {station_id} during this 4-hour window.")
 
-    # Bottom Visual Waveform Plot
-    st.subheader("📈 Time-Series Waveform & Envelope Analysis")
+    # Bottom Heave and Envelope Graph
+    st.subheader(f"📈 Waveform & Envelope Analysis — Buoy {station_id} ({station_name})")
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
@@ -291,7 +299,7 @@ else:
             x=[p["time_min"] for p in valid_packets],
             y=[p["height_ft"]/2.0 for p in valid_packets],
             mode="markers",
-            name="Target Groundswell Set",
+            name=f"Target Set ({station_name})",
             marker=dict(color="#00e676", size=10, symbol="diamond", line=dict(width=1, color="#ffffff")),
             hovertemplate="<b>Set Packet</b><br>Time: +%{x:.1f} min<br>Height: %{customdata[0]:.2f} ft<br>Waves: ~%{customdata[1]} waves<br>Bearing: %{customdata[2]:.1f}° True<extra></extra>",
             customdata=[[p["height_ft"], p["waves"], p["direction"]] for p in valid_packets]
