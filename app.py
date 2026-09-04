@@ -22,12 +22,12 @@ STATIONS = {
     "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf", "lat": 33.618, "lon": -118.317}
 }
 
-# ------------------ TOP CONTROLS (VISIBLE ON MOBILE) ------------------
+# ------------------ TOP CONTROLS ------------------
 st.title("🏄 lb surf")
 
 c_top1, c_top2 = st.columns([2, 1])
 with c_top1:
-    selected_label = st.selectbox("Select Buoy Station", list(STATIONS.keys()), index=0)
+    selected_label = st.selectbox("Select Buoy Station", list(STATIONS.keys()), index=9) # Defaults to 067
     station_info = STATIONS[selected_label]
     station_id = station_info["id"]
     station_name = station_info["name"]
@@ -40,14 +40,13 @@ with c_top2:
 
 st.markdown(f"### Currently Monitoring: **Buoy {station_id} — {station_name}**")
 
-# Time Window Selection Dropdown (Main Page)
-time_mode = st.selectbox("Time Window Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=0)
+time_mode = st.selectbox("Time Window Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=1)
 
 selected_end_epoch = None
 if time_mode == "Historical Lookback":
     c_hist1, c_hist2 = st.columns(2)
     with c_hist1:
-        default_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        default_date = datetime(2026, 8, 26).date()
         target_date = st.date_input("Target Date (UTC)", value=default_date)
     with c_hist2:
         target_time = st.time_input("Target End Time (UTC)", value=time(12, 0))
@@ -70,12 +69,23 @@ with st.sidebar:
 @st.cache_data(ttl=900)
 def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_min, wp_max):
     hours = 4.0
-    url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
     
+    # Auto-Route between Realtime Buffer and Full Archive
+    if end_epoch is None:
+        url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
+    else:
+        # Check archive first for dates older than a couple days
+        url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_xy.nc"
+        
     try:
         ds = xr.open_dataset(url)
-    except Exception as e:
-        return None, f"Failed to connect to CDIP OpenDAP endpoint for Station {station}: {e}"
+    except Exception:
+        # Fallback to realtime if archive path structure differs
+        try:
+            url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
+            ds = xr.open_dataset(url)
+        except Exception as e:
+            return None, f"Failed to connect to CDIP endpoint for Station {station}: {e}"
 
     fs = float(ds.xyzSampleRate.values)
     stride = 2
@@ -83,16 +93,20 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     samples_needed = int(hours * 3600 * fs)
 
     total_len = len(ds.xyzZDisplacement)
+    start_time_base = int(ds.xyzStartTime.values)
+    file_end_time = start_time_base + int(total_len / fs)
     
+    dt_file_start = datetime.fromtimestamp(start_time_base, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    dt_file_end = datetime.fromtimestamp(file_end_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
     if end_epoch is None:
         idx_start = max(0, total_len - samples_needed)
         idx_end = total_len
     else:
-        start_time_base = int(ds.xyzStartTime.values)
         target_sample_index = int((end_epoch - start_time_base) * fs)
         
         if target_sample_index <= samples_needed:
-            return None, "Target historical time is prior to the start of this file's recorded telemetry."
+            return None, f"Requested date is prior to file start. Available telemetry: **{dt_file_start}** to **{dt_file_end}**."
         if target_sample_index > total_len:
             target_sample_index = total_len
             
@@ -114,7 +128,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     n_pts = len(z_raw)
     time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-    # 1. Groundswell Decomposition
+    # 1. Groundswell Processing
     b_gs, a_gs = butter(4, [1.0 / p_max, 1.0 / p_min], btype="band", fs=eff_fs)
     z_gs = filtfilt(b_gs, a_gs, z_raw)
     x_gs = filtfilt(b_gs, a_gs, x_raw)
@@ -161,7 +175,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
             "valid": is_valid
         })
 
-    # 2. Windswell Decomposition
+    # 2. Windswell Processing
     nyq = eff_fs / 2.0
     high_wind = min(1.0 / wp_min, nyq * 0.95)
     low_wind = 1.0 / wp_max
@@ -207,10 +221,11 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         "z_env_smooth": z_env_gs_smooth * 3.28084,
         "threshold": thresh_gs * 3.28084,
         "gs_packets": gs_packets,
-        "wind_summary": wind_summary
+        "wind_summary": wind_summary,
+        "file_range": f"{dt_file_start} to {dt_file_end}"
     }, None
 
-with st.spinner(f"Querying 3D wave displacement from Buoy {station_id}..."):
+with st.spinner(f"Querying 3D displacement from Buoy {station_id}..."):
     data, err = fetch_and_process_cdip(station_id, selected_end_epoch, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
 
 if err:
@@ -219,6 +234,7 @@ else:
     all_packets = data["gs_packets"]
     valid_packets = [p for p in all_packets if p["valid"]]
     wind = data["wind_summary"]
+    st.caption(f"Telemetry Span: {data['file_range']}")
 
     if len(valid_packets) > 1:
         intervals = [valid_packets[i+1]["time_min"] - valid_packets[i]["time_min"] for i in range(len(valid_packets)-1)]
@@ -233,7 +249,7 @@ else:
         avg_dir = valid_packets[0]["direction"]
     else:
         avg_lull = min_lull = max_lull = avg_set_height = 0.0
-        avg_dir = 205.0  # Fallback reference
+        avg_dir = 205.0
 
     # 1. Primary Metrics
     st.subheader(f"🎯 Primary Groundswell — Buoy {station_id} ({station_name})")
@@ -329,7 +345,6 @@ else:
     # 5. Southern California Swell Shadowing Map
     st.subheader(f"🗺️ Southern California Swell Shadow Projection ({avg_dir:.0f}° True)")
 
-    # Island Geometries (Rough Bounding Polygons)
     islands = {
         "Catalina Island": [
             (33.48, -118.60), (33.43, -118.50), (33.32, -118.32), 
@@ -345,15 +360,13 @@ else:
         ]
     }
 
-    # Project Shadow Cones downwave (angle = avg_dir - 180°)
     shadow_angle_rad = np.radians((avg_dir - 180.0 + 360.0) % 360.0)
-    shadow_length = 0.9  # Degrees geographic offset downwave
+    shadow_length = 0.9
     d_lat = shadow_length * np.cos(shadow_angle_rad)
     d_lon = shadow_length * np.sin(shadow_angle_rad)
 
     map_fig = go.Figure()
 
-    # Draw Shadow Zones
     for name, coords in islands.items():
         sh_lats = [pt[0] for pt in coords] + [pt[0] + d_lat for pt in reversed(coords)]
         sh_lons = [pt[1] for pt in coords] + [pt[1] + d_lon for pt in reversed(coords)]
@@ -365,10 +378,9 @@ else:
             line=dict(color="rgba(239, 83, 80, 0.45)", width=1),
             name=f"Shadow ({name})",
             hoverinfo="text",
-            text=f"Blocked / Shadowed Zone behind {name}"
+            text=f"Blocked Zone behind {name}"
         ))
 
-    # Draw Islands
     for name, coords in islands.items():
         map_fig.add_trace(go.Scattergeo(
             lat=[pt[0] for pt in coords],
@@ -381,7 +393,6 @@ else:
             text=name
         ))
 
-    # Mark Brooks Street (Target Break)
     brooks_lat, brooks_lon = 33.535, -117.778
     map_fig.add_trace(go.Scattergeo(
         lat=[brooks_lat],
@@ -394,7 +405,6 @@ else:
         hoverinfo="text"
     ))
 
-    # Mark Active Selected Buoy
     map_fig.add_trace(go.Scattergeo(
         lat=[station_info["lat"]],
         lon=[station_info["lon"]],
@@ -405,7 +415,6 @@ else:
         name=f"Buoy {station_id} ({station_name})"
     ))
 
-    # Swell Vector Arrow Indicator
     arrow_lat = [32.4, 32.4 + 0.4 * np.cos(shadow_angle_rad)]
     arrow_lon = [-118.9, -118.9 + 0.4 * np.sin(shadow_angle_rad)]
     map_fig.add_trace(go.Scattergeo(
