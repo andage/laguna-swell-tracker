@@ -7,49 +7,56 @@ from datetime import datetime, time, timezone, timedelta
 
 st.set_page_config(page_title="lb surf", page_icon="🏄", layout="wide")
 
-# Active Southern California Stations (Realtime _xy.nc streams)
+# Active Southern California Stations
 STATIONS = {
-    "092 - San Pedro South": {"id": "092", "name": "San Pedro South"},
-    "045 - Oceanside Offshore": {"id": "045", "name": "Oceanside Offshore"},
-    "220 - Mission Bay West": {"id": "220", "name": "Mission Bay West"},
-    "100 - Torrey Pines Outer": {"id": "100", "name": "Torrey Pines Outer"},
-    "153 - Imperial Beach Nearshore": {"id": "153", "name": "Imperial Beach Nearshore"},
-    "241 - Del Mar Nearshore": {"id": "241", "name": "Del Mar Nearshore"},
-    "028 - San Pedro": {"id": "028", "name": "San Pedro (Outer Shelf)"},
-    "215 - Santa Monica Bay": {"id": "215", "name": "Santa Monica Bay"},
-    "111 - San Pedro Channel": {"id": "111", "name": "San Pedro Channel"},
-    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer"},
-    "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf"}
+    "092 - San Pedro South": {"id": "092", "name": "San Pedro South", "lat": 33.618, "lon": -118.317},
+    "045 - Oceanside Offshore": {"id": "045", "name": "Oceanside Offshore", "lat": 33.178, "lon": -117.472},
+    "220 - Mission Bay West": {"id": "220", "name": "Mission Bay West", "lat": 32.749, "lon": -117.378},
+    "100 - Torrey Pines Outer": {"id": "100", "name": "Torrey Pines Outer", "lat": 32.930, "lon": -117.392},
+    "153 - Imperial Beach Nearshore": {"id": "153", "name": "Imperial Beach Nearshore", "lat": 32.580, "lon": -117.168},
+    "241 - Del Mar Nearshore": {"id": "241", "name": "Del Mar Nearshore", "lat": 32.956, "lon": -117.279},
+    "028 - San Pedro": {"id": "028", "name": "San Pedro (Outer Shelf)", "lat": 33.564, "lon": -118.477},
+    "215 - Santa Monica Bay": {"id": "215", "name": "Santa Monica Bay", "lat": 33.855, "lon": -118.634},
+    "111 - San Pedro Channel": {"id": "111", "name": "San Pedro Channel", "lat": 33.606, "lon": -118.318},
+    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer", "lat": 33.221, "lon": -119.881},
+    "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf", "lat": 33.618, "lon": -118.317}
 }
 
-# Top Station Selection & Controls
-col_top1, col_top2 = st.columns([3, 1])
-with col_top1:
-    selected_label = st.selectbox("Select Station", list(STATIONS.keys()), index=0)
+# ------------------ TOP CONTROLS (VISIBLE ON MOBILE) ------------------
+st.title("🏄 lb surf")
+
+c_top1, c_top2 = st.columns([2, 1])
+with c_top1:
+    selected_label = st.selectbox("Select Buoy Station", list(STATIONS.keys()), index=0)
     station_info = STATIONS[selected_label]
     station_id = station_info["id"]
     station_name = station_info["name"]
-with col_top2:
+with c_top2:
     st.write("")
     st.write("")
-    if st.button("🔄 Refresh / Clear Cache"):
+    if st.button("🔄 Refresh Data / Clear Cache"):
         st.cache_data.clear()
         st.rerun()
 
-# Sidebar: Time Window & Swell Bands
-with st.sidebar:
-    st.header("🕒 Time Window Selection")
-    time_mode = st.radio("Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=0)
-    
-    selected_end_epoch = None
-    if time_mode == "Historical Lookback":
+st.markdown(f"### Currently Monitoring: **Buoy {station_id} — {station_name}**")
+
+# Time Window Selection Dropdown (Main Page)
+time_mode = st.selectbox("Time Window Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=0)
+
+selected_end_epoch = None
+if time_mode == "Historical Lookback":
+    c_hist1, c_hist2 = st.columns(2)
+    with c_hist1:
         default_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
         target_date = st.date_input("Target Date (UTC)", value=default_date)
+    with c_hist2:
         target_time = st.time_input("Target End Time (UTC)", value=time(12, 0))
-        dt_combined = datetime.combine(target_date, target_time).replace(tzinfo=timezone.utc)
-        selected_end_epoch = int(dt_combined.timestamp())
-        st.caption(f"Window: 4h prior to {dt_combined.strftime('%Y-%m-%d %H:%M UTC')}")
+    dt_combined = datetime.combine(target_date, target_time).replace(tzinfo=timezone.utc)
+    selected_end_epoch = int(dt_combined.timestamp())
+    st.info(f"Targeting 4-hour window ending at: **{dt_combined.strftime('%Y-%m-%d %H:%M UTC')}**")
 
+# Swell Filter Settings (Sidebar)
+with st.sidebar:
     st.header("🎯 Groundswell Filter")
     period_min = st.number_input("Min Groundswell Period (s)", 10.0, 25.0, 14.0, 1.0)
     period_max = st.number_input("Max Groundswell Period (s)", 12.0, 30.0, 22.0, 1.0)
@@ -107,7 +114,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     n_pts = len(z_raw)
     time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-    # 1. Groundswell Processing
+    # 1. Groundswell Decomposition
     b_gs, a_gs = butter(4, [1.0 / p_max, 1.0 / p_min], btype="band", fs=eff_fs)
     z_gs = filtfilt(b_gs, a_gs, z_raw)
     x_gs = filtfilt(b_gs, a_gs, x_raw)
@@ -154,7 +161,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
             "valid": is_valid
         })
 
-    # 2. Windswell Processing
+    # 2. Windswell Decomposition
     nyq = eff_fs / 2.0
     high_wind = min(1.0 / wp_min, nyq * 0.95)
     low_wind = 1.0 / wp_max
@@ -203,11 +210,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         "wind_summary": wind_summary
     }, None
 
-# Main Body
-st.title("🏄 lb surf")
-st.markdown(f"### Currently Monitoring: **Buoy {station_id} — {station_name}**")
-
-with st.spinner(f"Querying 3D wave telemetry from Buoy {station_id} ({station_name})..."):
+with st.spinner(f"Querying 3D wave displacement from Buoy {station_id}..."):
     data, err = fetch_and_process_cdip(station_id, selected_end_epoch, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
 
 if err:
@@ -229,9 +232,10 @@ else:
         avg_set_height = valid_packets[0]["height_ft"]
         avg_dir = valid_packets[0]["direction"]
     else:
-        avg_lull = min_lull = max_lull = avg_set_height = avg_dir = 0.0
+        avg_lull = min_lull = max_lull = avg_set_height = 0.0
+        avg_dir = 205.0  # Fallback reference
 
-    # Top Metric Tiles
+    # 1. Primary Metrics
     st.subheader(f"🎯 Primary Groundswell — Buoy {station_id} ({station_name})")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Average Set Lull", f"{avg_lull:.1f} min" if avg_lull > 0 else "N/A")
@@ -240,7 +244,7 @@ else:
     delta_tag = "Historical 4.0h Slice" if time_mode == "Historical Lookback" else "Past 4.0 Hours"
     m4.metric("Sets Detected", f"{len(valid_packets)} sets", delta=delta_tag, delta_color="normal")
 
-    # Windswell Indicator Tiles
+    # 2. Windswell Metrics
     st.subheader(f"💨 Background Windswell Chop — Buoy {station_id}")
     w1, w2, w3, w4 = st.columns(4)
     w1.metric("Chop Pulse Spacing", f"{wind['avg_interval_min']:.1f} min" if wind['avg_interval_min'] > 0 else "Continuous")
@@ -248,7 +252,7 @@ else:
     w3.metric("Peak Chop Spike", f"{wind['max_height_ft']:.1f} ft")
     w4.metric("Mean Chop Direction", f"{wind['avg_direction']:.0f}° True")
 
-    # Detailed Set Arrival Table
+    # 3. Groundswell Set Log Table
     if valid_packets:
         st.subheader(f"📋 Groundswell Set Log for Buoy {station_id} ({station_name})")
         rows = []
@@ -266,7 +270,7 @@ else:
     else:
         st.info(f"No groundswell sets crossed the threshold within your directional window on Buoy {station_id} during this 4-hour window.")
 
-    # Bottom Heave and Envelope Graph
+    # 4. Waveform & Envelope Analysis Plot
     st.subheader(f"📈 Waveform & Envelope Analysis — Buoy {station_id} ({station_name})")
     fig = go.Figure()
 
@@ -309,7 +313,7 @@ else:
         xaxis_title="Elapsed Time in Window (Minutes)",
         yaxis_title="Surface Heave (Feet)",
         template="plotly_dark",
-        height=450,
+        height=420,
         margin=dict(l=20, r=20, t=20, b=10),
         legend=dict(
             orientation="h",
@@ -320,5 +324,124 @@ else:
             font=dict(size=11)
         )
     )
-
     st.plotly_chart(fig, use_container_width=True)
+
+    # 5. Southern California Swell Shadowing Map
+    st.subheader(f"🗺️ Southern California Swell Shadow Projection ({avg_dir:.0f}° True)")
+
+    # Island Geometries (Rough Bounding Polygons)
+    islands = {
+        "Catalina Island": [
+            (33.48, -118.60), (33.43, -118.50), (33.32, -118.32), 
+            (33.30, -118.35), (33.35, -118.52), (33.48, -118.60)
+        ],
+        "San Clemente Island": [
+            (33.03, -118.60), (32.95, -118.55), (32.81, -118.36),
+            (32.82, -118.42), (33.00, -118.62), (33.03, -118.60)
+        ],
+        "San Nicolas Island": [
+            (33.28, -119.58), (33.25, -119.45), (33.22, -119.48), 
+            (33.25, -119.59), (33.28, -119.58)
+        ]
+    }
+
+    # Project Shadow Cones downwave (angle = avg_dir - 180°)
+    shadow_angle_rad = np.radians((avg_dir - 180.0 + 360.0) % 360.0)
+    shadow_length = 0.9  # Degrees geographic offset downwave
+    d_lat = shadow_length * np.cos(shadow_angle_rad)
+    d_lon = shadow_length * np.sin(shadow_angle_rad)
+
+    map_fig = go.Figure()
+
+    # Draw Shadow Zones
+    for name, coords in islands.items():
+        sh_lats = [pt[0] for pt in coords] + [pt[0] + d_lat for pt in reversed(coords)]
+        sh_lons = [pt[1] for pt in coords] + [pt[1] + d_lon for pt in reversed(coords)]
+        map_fig.add_trace(go.Scattergeo(
+            lat=sh_lats,
+            lon=sh_lons,
+            fill="toself",
+            fillcolor="rgba(239, 83, 80, 0.28)",
+            line=dict(color="rgba(239, 83, 80, 0.45)", width=1),
+            name=f"Shadow ({name})",
+            hoverinfo="text",
+            text=f"Blocked / Shadowed Zone behind {name}"
+        ))
+
+    # Draw Islands
+    for name, coords in islands.items():
+        map_fig.add_trace(go.Scattergeo(
+            lat=[pt[0] for pt in coords],
+            lon=[pt[1] for pt in coords],
+            fill="toself",
+            fillcolor="#546e7a",
+            line=dict(color="#b0bec5", width=1.5),
+            name=name,
+            hoverinfo="text",
+            text=name
+        ))
+
+    # Mark Brooks Street (Target Break)
+    brooks_lat, brooks_lon = 33.535, -117.778
+    map_fig.add_trace(go.Scattergeo(
+        lat=[brooks_lat],
+        lon=[brooks_lon],
+        mode="markers+text",
+        marker=dict(size=11, color="#00e676", symbol="star"),
+        text=["Brooks St, Laguna Beach"],
+        textposition="top right",
+        name="Brooks Street (Laguna)",
+        hoverinfo="text"
+    ))
+
+    # Mark Active Selected Buoy
+    map_fig.add_trace(go.Scattergeo(
+        lat=[station_info["lat"]],
+        lon=[station_info["lon"]],
+        mode="markers+text",
+        marker=dict(size=9, color="#29b6f6", symbol="circle"),
+        text=[f"Buoy {station_id}"],
+        textposition="bottom left",
+        name=f"Buoy {station_id} ({station_name})"
+    ))
+
+    # Swell Vector Arrow Indicator
+    arrow_lat = [32.4, 32.4 + 0.4 * np.cos(shadow_angle_rad)]
+    arrow_lon = [-118.9, -118.9 + 0.4 * np.sin(shadow_angle_rad)]
+    map_fig.add_trace(go.Scattergeo(
+        lat=arrow_lat,
+        lon=arrow_lon,
+        mode="lines+markers",
+        line=dict(color="#00e676", width=3),
+        marker=dict(size=[0, 8], symbol="triangle-up"),
+        name=f"Swell Approach Vector ({avg_dir:.0f}°)"
+    ))
+
+    map_fig.update_layout(
+        geo=dict(
+            scope="usa",
+            projection_type="mercator",
+            center=dict(lat=33.35, lon=-118.4),
+            lataxis=dict(range=[32.3, 34.1]),
+            lonaxis=dict(range=[-120.2, -117.0]),
+            showland=True,
+            landcolor="#1e222d",
+            showocean=True,
+            oceancolor="#0f131a",
+            showcoastlines=True,
+            coastlinecolor="#78909c",
+            resolution=50
+        ),
+        height=520,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.05,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=10)
+        )
+    )
+
+    st.plotly_chart(map_fig, use_container_width=True)
