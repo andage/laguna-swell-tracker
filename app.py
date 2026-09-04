@@ -46,7 +46,7 @@ selected_end_epoch = None
 if time_mode == "Historical Lookback":
     c_hist1, c_hist2 = st.columns(2)
     with c_hist1:
-        default_date = (datetime.now(timezone.utc) - timedelta(days=2)).date()
+        default_date = datetime(2026, 8, 26).date()
         target_date = st.date_input("Target Date (UTC)", value=default_date)
     with c_hist2:
         target_time = st.time_input("Target End Time (UTC)", value=time(12, 0))
@@ -70,27 +70,49 @@ with st.sidebar:
 def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_min, wp_max):
     hours = 4.0
     
-    # Candidate endpoints to query
-    endpoints = [
-        f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc",
-        f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_xy.nc"
-    ]
-    
+    # Candidate endpoints: check deployment archive files first for lookbacks, then realtime
+    if end_epoch is None:
+        urls_to_try = [
+            f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
+        ]
+    else:
+        # Dynamic search through recent deployments down to fallback realtime
+        deployment_urls = [
+            f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_d{d:02d}.nc"
+            for d in range(25, 10, -1)
+        ]
+        urls_to_try = deployment_urls + [
+            f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_xy.nc",
+            f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
+        ]
+
     ds = None
     connected_url = None
-    for url in endpoints:
+    file_range_detected = None
+
+    for url in urls_to_try:
         try:
             temp_ds = xr.open_dataset(url)
-            # Verify file contains displacement data
             if "xyzZDisplacement" in temp_ds and len(temp_ds.xyzZDisplacement) > 0:
-                ds = temp_ds
-                connected_url = url
-                break
+                if end_epoch is not None and "xyzStartTime" in temp_ds:
+                    start_val = float(temp_ds.xyzStartTime.values)
+                    fs_temp = float(temp_ds.xyzSampleRate.values) if "xyzSampleRate" in temp_ds else 1.28
+                    dur = len(temp_ds.xyzZDisplacement) / fs_temp
+                    
+                    # Check if requested epoch is covered by this deployment
+                    if start_val <= end_epoch <= (start_val + dur + 3600):
+                        ds = temp_ds
+                        connected_url = url
+                        break
+                else:
+                    ds = temp_ds
+                    connected_url = url
+                    break
         except Exception:
             continue
 
     if ds is None:
-        return None, f"Could not connect to an active OpenDAP telemetry stream for Station {station}."
+        return None, f"Could not locate an active CDIP deployment file covering your target date on Station {station}."
 
     try:
         fs = float(ds.xyzSampleRate.values)
@@ -102,17 +124,15 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     samples_needed = int(hours * 3600 * fs)
     total_len = len(ds.xyzZDisplacement)
 
-    # Robust extraction of base timestamp
     start_time_base = None
     if "xyzStartTime" in ds:
         try:
             val = float(ds.xyzStartTime.values)
-            if val > 100000000: # Valid POSIX sanity check
+            if val > 100000000:
                 start_time_base = val
         except Exception:
             start_time_base = None
 
-    # Format bounds safely
     if start_time_base is not None:
         try:
             dt_file_start = datetime.fromtimestamp(start_time_base, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -120,11 +140,11 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
             dt_file_end = datetime.fromtimestamp(file_end_epoch, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
             range_desc = f"{dt_file_start} to {dt_file_end}"
         except (OSError, ValueError, OverflowError):
-            range_desc = "Rolling Real-Time Buffer"
+            range_desc = "Active Telemetry Stream"
     else:
         range_desc = "Rolling Real-Time Buffer"
 
-    # Index Calculation
+    # Determine slice indices
     if end_epoch is None:
         idx_start = max(0, total_len - samples_needed)
         idx_end = total_len
