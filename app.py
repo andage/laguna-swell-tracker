@@ -5,7 +5,7 @@ from scipy.signal import butter, filtfilt, hilbert, find_peaks
 import plotly.graph_objects as go
 from datetime import datetime, timezone
 
-st.set_page_config(page_title="Swell Consistency Analyzer", layout="wide")
+st.set_page_config(page_title="LBsurf", layout="wide")
 
 # Station Catalog
 STATIONS = {
