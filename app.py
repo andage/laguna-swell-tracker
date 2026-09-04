@@ -9,6 +9,7 @@ st.set_page_config(page_title="lb surf", page_icon="🏄", layout="wide")
 
 # Active Southern California Stations
 STATIONS = {
+    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer", "lat": 33.221, "lon": -119.881},
     "092 - San Pedro South": {"id": "092", "name": "San Pedro South", "lat": 33.618, "lon": -118.317},
     "045 - Oceanside Offshore": {"id": "045", "name": "Oceanside Offshore", "lat": 33.178, "lon": -117.472},
     "220 - Mission Bay West": {"id": "220", "name": "Mission Bay West", "lat": 32.749, "lon": -117.378},
@@ -18,7 +19,6 @@ STATIONS = {
     "028 - San Pedro": {"id": "028", "name": "San Pedro (Outer Shelf)", "lat": 33.564, "lon": -118.477},
     "215 - Santa Monica Bay": {"id": "215", "name": "Santa Monica Bay", "lat": 33.855, "lon": -118.634},
     "111 - San Pedro Channel": {"id": "111", "name": "San Pedro Channel", "lat": 33.606, "lon": -118.318},
-    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer", "lat": 33.221, "lon": -119.881},
     "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf", "lat": 33.618, "lon": -118.317}
 }
 
@@ -27,7 +27,7 @@ st.title("🏄 lb surf")
 
 c_top1, c_top2 = st.columns([2, 1])
 with c_top1:
-    selected_label = st.selectbox("Select Buoy Station", list(STATIONS.keys()), index=9) # Defaults to 067
+    selected_label = st.selectbox("Select Buoy Station", list(STATIONS.keys()), index=0)
     station_info = STATIONS[selected_label]
     station_id = station_info["id"]
     station_name = station_info["name"]
@@ -40,13 +40,13 @@ with c_top2:
 
 st.markdown(f"### Currently Monitoring: **Buoy {station_id} — {station_name}**")
 
-time_mode = st.selectbox("Time Window Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=1)
+time_mode = st.selectbox("Time Window Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=0)
 
 selected_end_epoch = None
 if time_mode == "Historical Lookback":
     c_hist1, c_hist2 = st.columns(2)
     with c_hist1:
-        default_date = datetime(2026, 8, 26).date()
+        default_date = (datetime.now(timezone.utc) - timedelta(days=2)).date()
         target_date = st.date_input("Target Date (UTC)", value=default_date)
     with c_hist2:
         target_time = st.time_input("Target End Time (UTC)", value=time(12, 0))
@@ -54,7 +54,7 @@ if time_mode == "Historical Lookback":
     selected_end_epoch = int(dt_combined.timestamp())
     st.info(f"Targeting 4-hour window ending at: **{dt_combined.strftime('%Y-%m-%d %H:%M UTC')}**")
 
-# Swell Filter Settings (Sidebar)
+# Swell Filter Settings
 with st.sidebar:
     st.header("🎯 Groundswell Filter")
     period_min = st.number_input("Min Groundswell Period (s)", 10.0, 25.0, 14.0, 1.0)
@@ -70,46 +70,75 @@ with st.sidebar:
 def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_min, wp_max):
     hours = 4.0
     
-    # Auto-Route between Realtime Buffer and Full Archive
-    if end_epoch is None:
-        url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
-    else:
-        # Check archive first for dates older than a couple days
-        url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_xy.nc"
-        
-    try:
-        ds = xr.open_dataset(url)
-    except Exception:
-        # Fallback to realtime if archive path structure differs
+    # Candidate endpoints to query
+    endpoints = [
+        f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc",
+        f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_xy.nc"
+    ]
+    
+    ds = None
+    connected_url = None
+    for url in endpoints:
         try:
-            url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
-            ds = xr.open_dataset(url)
-        except Exception as e:
-            return None, f"Failed to connect to CDIP endpoint for Station {station}: {e}"
+            temp_ds = xr.open_dataset(url)
+            # Verify file contains displacement data
+            if "xyzZDisplacement" in temp_ds and len(temp_ds.xyzZDisplacement) > 0:
+                ds = temp_ds
+                connected_url = url
+                break
+        except Exception:
+            continue
 
-    fs = float(ds.xyzSampleRate.values)
+    if ds is None:
+        return None, f"Could not connect to an active OpenDAP telemetry stream for Station {station}."
+
+    try:
+        fs = float(ds.xyzSampleRate.values)
+    except Exception:
+        fs = 1.28
+
     stride = 2
     eff_fs = fs / stride
     samples_needed = int(hours * 3600 * fs)
-
     total_len = len(ds.xyzZDisplacement)
-    start_time_base = int(ds.xyzStartTime.values)
-    file_end_time = start_time_base + int(total_len / fs)
-    
-    dt_file_start = datetime.fromtimestamp(start_time_base, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-    dt_file_end = datetime.fromtimestamp(file_end_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
+    # Robust extraction of base timestamp
+    start_time_base = None
+    if "xyzStartTime" in ds:
+        try:
+            val = float(ds.xyzStartTime.values)
+            if val > 100000000: # Valid POSIX sanity check
+                start_time_base = val
+        except Exception:
+            start_time_base = None
+
+    # Format bounds safely
+    if start_time_base is not None:
+        try:
+            dt_file_start = datetime.fromtimestamp(start_time_base, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+            file_end_epoch = start_time_base + (total_len / fs)
+            dt_file_end = datetime.fromtimestamp(file_end_epoch, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+            range_desc = f"{dt_file_start} to {dt_file_end}"
+        except (OSError, ValueError, OverflowError):
+            range_desc = "Rolling Real-Time Buffer"
+    else:
+        range_desc = "Rolling Real-Time Buffer"
+
+    # Index Calculation
     if end_epoch is None:
         idx_start = max(0, total_len - samples_needed)
         idx_end = total_len
     else:
+        if start_time_base is None:
+            return None, "Selected buoy file lacks an absolute start timestamp; historical indexing unavailable."
+
         target_sample_index = int((end_epoch - start_time_base) * fs)
-        
+
         if target_sample_index <= samples_needed:
-            return None, f"Requested date is prior to file start. Available telemetry: **{dt_file_start}** to **{dt_file_end}**."
+            return None, f"Requested date precedes the start of this file. Telemetry span available: **{range_desc}**."
         if target_sample_index > total_len:
             target_sample_index = total_len
-            
+
         idx_end = target_sample_index
         idx_start = max(0, idx_end - samples_needed)
 
@@ -118,7 +147,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         x_raw = ds.xyzXDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
         y_raw = ds.xyzYDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
     except Exception as e:
-        return None, f"Error reading displacement arrays: {e}"
+        return None, f"Error slicing displacement arrays: {e}"
 
     fill_mask = (z_raw < -900) | (x_raw < -900) | (y_raw < -900)
     z_raw[fill_mask] = 0.0
@@ -222,10 +251,10 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         "threshold": thresh_gs * 3.28084,
         "gs_packets": gs_packets,
         "wind_summary": wind_summary,
-        "file_range": f"{dt_file_start} to {dt_file_end}"
+        "file_range": range_desc
     }, None
 
-with st.spinner(f"Querying 3D displacement from Buoy {station_id}..."):
+with st.spinner(f"Querying 3D wave telemetry from Buoy {station_id}..."):
     data, err = fetch_and_process_cdip(station_id, selected_end_epoch, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
 
 if err:
@@ -234,7 +263,7 @@ else:
     all_packets = data["gs_packets"]
     valid_packets = [p for p in all_packets if p["valid"]]
     wind = data["wind_summary"]
-    st.caption(f"Telemetry Span: {data['file_range']}")
+    st.caption(f"Active Telemetry Span: **{data['file_range']}**")
 
     if len(valid_packets) > 1:
         intervals = [valid_packets[i+1]["time_min"] - valid_packets[i]["time_min"] for i in range(len(valid_packets)-1)]
