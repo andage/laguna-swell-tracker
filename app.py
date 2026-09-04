@@ -129,8 +129,8 @@ def fetch_and_process_cdip(station, hours, p_min, p_max, d_min, d_max):
     }, None
 
 # Execution & Display
-st.title("🏄 Real-Time Swell Set Consistency Analyzer")
-st.caption(f"Connected to Scripps CDIP THREDDS OpenDAP | Station {station_id}")
+st.title("LBsurf")
+st.caption(f"Scripps CDIP Station {station_id}")
 
 with st.spinner("Fetching 3D displacement vectors and calculating packet consistency..."):
     data, err = fetch_and_process_cdip(station_id, duration_hours, period_min, period_max, dir_min, dir_max)
