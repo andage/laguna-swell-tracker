@@ -3,10 +3,11 @@ import numpy as np
 import xarray as xr
 from scipy.signal import butter, filtfilt, hilbert, find_peaks
 import plotly.graph_objects as go
+from datetime import datetime, time, timezone, timedelta
 
 st.set_page_config(page_title="LB Surf", page_icon="🏄", layout="wide")
 
-# Updated Buoy Catalog
+# Buoy Stations Catalog
 STATIONS = {
     "092 - San Pedro South": "092",
     "271 - Green Beach Offshore (Camp Pendleton/San Clemente)": "271",
@@ -14,32 +15,44 @@ STATIONS = {
     "045 - Oceanside Offshore": "045"
 }
 
-# Top Controls Bar
-col_sel1, col_sel2 = st.columns([2, 1])
-with col_sel1:
+# Top Station Selection & Refresh
+col_top1, col_top2 = st.columns([2, 1])
+with col_top1:
     selected_station_label = st.selectbox("Select Station", list(STATIONS.keys()), index=0)
     station_id = STATIONS[selected_station_label]
-with col_sel2:
+with col_top2:
     st.write("")
     st.write("")
-    if st.button("🔄 Refresh Real-Time Data"):
+    if st.button("🔄 Refresh Data / Clear Cache"):
         st.cache_data.clear()
         st.rerun()
 
-# Swell Parameter Sidebar
+# Sidebar: Time Window & Swell Filters
 with st.sidebar:
-    st.header("Groundswell Configuration")
-    period_min = st.number_input("Min Groundswell Period (s)", min_value=10.0, max_value=25.0, value=14.0, step=1.0)
-    period_max = st.number_input("Max Groundswell Period (s)", min_value=12.0, max_value=30.0, value=22.0, step=1.0)
+    st.header("🕒 Time Window Selection")
+    time_mode = st.radio("Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=0)
+    
+    selected_end_epoch = None
+    if time_mode == "Historical Lookback":
+        default_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        target_date = st.date_input("Target Date (UTC)", value=default_date)
+        target_time = st.time_input("Target End Time (UTC)", value=time(12, 0))
+        dt_combined = datetime.combine(target_date, target_time).replace(tzinfo=timezone.utc)
+        selected_end_epoch = int(dt_combined.timestamp())
+        st.caption(f"Window: 4h prior to {dt_combined.strftime('%Y-%m-%d %H:%M UTC')}")
+
+    st.header("🎯 Groundswell Filter")
+    period_min = st.number_input("Min Groundswell Period (s)", 10.0, 25.0, 14.0, 1.0)
+    period_max = st.number_input("Max Groundswell Period (s)", 12.0, 30.0, 22.0, 1.0)
     dir_min = st.number_input("Brooks Window Min (° True)", 0, 360, 190)
     dir_max = st.number_input("Brooks Window Max (° True)", 0, 360, 220)
 
-    st.header("Windswell Configuration")
-    wind_p_min = st.number_input("Min Windchop Period (s)", min_value=2.0, max_value=8.0, value=4.0, step=0.5)
-    wind_p_max = st.number_input("Max Windchop Period (s)", min_value=4.0, max_value=12.0, value=8.0, step=0.5)
+    st.header("💨 Windswell Filter")
+    wind_p_min = st.number_input("Min Windchop Period (s)", 2.0, 8.0, 4.0, 0.5)
+    wind_p_max = st.number_input("Max Windchop Period (s)", 4.0, 12.0, 8.0, 0.5)
 
 @st.cache_data(ttl=900)
-def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
+def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_min, wp_max):
     hours = 4.0
     url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
     
@@ -49,20 +62,35 @@ def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
         return None, f"Failed to connect to CDIP OpenDAP endpoint: {e}"
 
     fs = float(ds.xyzSampleRate.values)
-    total_samples = int(hours * 3600 * fs)
-    
-    # Subsample stride 2 (~0.64 Hz)
     stride = 2
     eff_fs = fs / stride
-    
-    try:
-        z_raw = ds.xyzZDisplacement[-total_samples::stride].values.astype(np.float64)
-        x_raw = ds.xyzXDisplacement[-total_samples::stride].values.astype(np.float64)
-        y_raw = ds.xyzYDisplacement[-total_samples::stride].values.astype(np.float64)
-    except Exception as e:
-        return None, f"Error reading displacement arrays: {e}"
+    samples_needed = int(hours * 3600 * fs)
 
-    # Clean fill/missing values
+    # Determine array indices (Realtime vs Historical Slice)
+    total_len = len(ds.xyzZDisplacement)
+    
+    if end_epoch is None:
+        idx_start = max(0, total_len - samples_needed)
+        idx_end = total_len
+    else:
+        start_time_base = int(ds.xyzStartTime.values)
+        target_sample_index = int((end_epoch - start_time_base) * fs)
+        
+        if target_sample_index <= samples_needed:
+            return None, "Target historical time is prior to the start of this file's recorded telemetry."
+        if target_sample_index > total_len:
+            target_sample_index = total_len
+            
+        idx_end = target_sample_index
+        idx_start = max(0, idx_end - samples_needed)
+
+    try:
+        z_raw = ds.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+        x_raw = ds.xyzXDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+        y_raw = ds.xyzYDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+    except Exception as e:
+        return None, f"Error slicing displacement dataset: {e}"
+
     fill_mask = (z_raw < -900) | (x_raw < -900) | (y_raw < -900)
     z_raw[fill_mask] = 0.0
     x_raw[fill_mask] = 0.0
@@ -71,15 +99,13 @@ def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
     n_pts = len(z_raw)
     time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-    # ------------------ 1. GROUNDSWELL EXTRACTION ------------------
+    # 1. Groundswell Decomposition
     b_gs, a_gs = butter(4, [1.0 / p_max, 1.0 / p_min], btype="band", fs=eff_fs)
     z_gs = filtfilt(b_gs, a_gs, z_raw)
     x_gs = filtfilt(b_gs, a_gs, x_raw)
     y_gs = filtfilt(b_gs, a_gs, y_raw)
 
     z_env_gs = np.abs(hilbert(z_gs))
-    
-    # Envelope visual smoothing
     smooth_win = int(eff_fs * 8.0)
     if smooth_win > 1:
         kernel = np.hanning(smooth_win)
@@ -88,7 +114,6 @@ def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
     else:
         z_env_gs_smooth = z_env_gs
 
-    # Groundswell Set Detection
     min_dist_gs = int(70.0 * eff_fs)
     thresh_gs = float(np.mean(z_env_gs) + 0.75 * np.std(z_env_gs))
     peaks_gs, _ = find_peaks(z_env_gs, height=thresh_gs, distance=min_dist_gs)
@@ -121,8 +146,7 @@ def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
             "valid": is_valid
         })
 
-    # ------------------ 2. WINDSWELL EXTRACTION ------------------
-    # Nyquist limit check for subsampled rate (~0.32 Hz)
+    # 2. Windswell Extraction
     nyq = eff_fs / 2.0
     high_wind = min(1.0 / wp_min, nyq * 0.95)
     low_wind = 1.0 / wp_max
@@ -137,8 +161,7 @@ def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
     min_dist_ws = int(20.0 * eff_fs)
     peaks_ws, _ = find_peaks(z_env_ws, height=thresh_ws, distance=min_dist_ws)
 
-    ws_heights = []
-    ws_dirs = []
+    ws_heights, ws_dirs = [], []
     for p in peaks_ws:
         w = int(6.0 * eff_fs)
         idx_s = max(0, p - w)
@@ -161,7 +184,6 @@ def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
         "max_height_ft": np.max(ws_heights) if ws_heights else 0.0,
         "avg_direction": np.mean(ws_dirs) if ws_dirs else 0.0,
         "avg_interval_min": avg_ws_interval,
-        "pulse_count": len(peaks_ws)
     }
 
     return {
@@ -174,11 +196,11 @@ def fetch_and_process_cdip(station, p_min, p_max, d_min, d_max, wp_min, wp_max):
     }, None
 
 # UI Header
-st.title("🏄 LB Surf Consistency Dashboard")
-st.caption(f"Real-Time Directional Swell Separation | Analyzing Station {station_id}")
+st.title("🏄 LB Surf")
+st.caption(f"Station {station_id}")
 
-with st.spinner("Processing 4-hour 3D wave displacement..."):
-    data, err = fetch_and_process_cdip(station_id, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
+with st.spinner("Processing 4-hour 3D wave telemetry..."):
+    data, err = fetch_and_process_cdip(station_id, selected_end_epoch, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
 
 if err:
     st.error(err)
@@ -194,32 +216,31 @@ else:
         max_lull = np.max(intervals)
         avg_set_height = np.mean([p["height_ft"] for p in valid_packets])
         avg_dir = np.mean([p["direction"] for p in valid_packets])
-        avg_waves = int(np.round(np.mean([p["waves"] for p in valid_packets])))
     elif len(valid_packets) == 1:
         avg_lull = min_lull = max_lull = 0.0
         avg_set_height = valid_packets[0]["height_ft"]
         avg_dir = valid_packets[0]["direction"]
-        avg_waves = valid_packets[0]["waves"]
     else:
-        avg_lull = min_lull = max_lull = avg_set_height = avg_dir = avg_waves = 0.0
+        avg_lull = min_lull = max_lull = avg_set_height = avg_dir = 0.0
 
-    # ------------------ TOP SECTION: PRIMARY METRIC TILES ------------------
+    # Top Metric Tiles
     st.subheader("🎯 Primary Groundswell (Target Window)")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Average Set Lull", f"{avg_lull:.1f} min" if avg_lull > 0 else "N/A")
     m2.metric("Lull Range (Min / Max)", f"{min_lull:.1f} / {max_lull:.1f} min" if avg_lull > 0 else "N/A")
     m3.metric("Deepwater Set Height", f"{avg_set_height:.1f} ft @ {avg_dir:.0f}°" if avg_set_height > 0 else "N/A")
-    m4.metric("Sets Detected", f"{len(valid_packets)} sets", delta="Past 4.0 Hours", delta_color="normal")
+    delta_tag = "Historical 4.0h Slice" if time_mode == "Historical Lookback" else "Past 4.0 Hours"
+    m4.metric("Sets Detected", f"{len(valid_packets)} sets", delta=delta_tag, delta_color="normal")
 
-    # ------------------ BACKGROUND WINDSWELL METRICS ------------------
+    # Windswell Indicators
     st.subheader("💨 Background Windswell Chop Indicator")
     w1, w2, w3, w4 = st.columns(4)
-    w1.metric("Chop Pulse Interval", f"{wind['avg_interval_min']:.1f} min" if wind['avg_interval_min'] > 0 else "Continuous")
+    w1.metric("Chop Pulse Spacing", f"{wind['avg_interval_min']:.1f} min" if wind['avg_interval_min'] > 0 else "Continuous")
     w2.metric("Average Chop Height", f"{wind['avg_height_ft']:.1f} ft")
     w3.metric("Peak Chop Spike", f"{wind['max_height_ft']:.1f} ft")
     w4.metric("Mean Chop Direction", f"{wind['avg_direction']:.0f}° True")
 
-    # ------------------ DETAILED LOG TABLE (MOVED UP) ------------------
+    # Set Log Table
     if valid_packets:
         st.subheader("📋 Groundswell Set Log")
         rows = []
@@ -228,20 +249,19 @@ else:
             rows.append({
                 "Set #": i + 1,
                 "Arrival Time": f"+{p['time_min']:.1f} min",
-                "Lull Wait": wait,
+                "Lull Duration": wait,
                 "Offshore Height": f"{p['height_ft']:.2f} ft",
                 "Waves in Packet": f"~{p['waves']} waves",
                 "Direction": f"{p['direction']:.1f}° True"
             })
         st.table(rows)
     else:
-        st.info("No groundswell sets crossed the threshold within your directional window over the last 4 hours.")
+        st.info("No groundswell sets crossed the threshold within your directional window during this 4-hour window.")
 
-    # ------------------ BOTTOM SECTION: SMOOTHED VISUAL TRACE ------------------
+    # Bottom Visual Waveform Plot
     st.subheader("📈 Time-Series Waveform & Envelope Analysis")
     fig = go.Figure()
 
-    # Heave displacement line (low opacity)
     fig.add_trace(go.Scatter(
         x=data["time_min"], 
         y=data["z_filt"], 
@@ -251,7 +271,6 @@ else:
         hoverinfo="skip"
     ))
 
-    # Smoothed Envelope Line
     fig.add_trace(go.Scatter(
         x=data["time_min"], 
         y=data["z_env_smooth"], 
@@ -260,15 +279,13 @@ else:
         line=dict(color="#ff9800", width=2.0)
     ))
 
-    # Set Trigger Line
     fig.add_hline(
         y=data["threshold"], 
         line=dict(color="#ef5350", dash="dot", width=1.2), 
-        annotation_text="Set Trigger Threshold",
+        annotation_text="Set Threshold",
         annotation_position="bottom left"
     )
 
-    # Valid Groundswell Sets Markers
     if valid_packets:
         fig.add_trace(go.Scatter(
             x=[p["time_min"] for p in valid_packets],
@@ -280,9 +297,8 @@ else:
             customdata=[[p["height_ft"], p["waves"], p["direction"]] for p in valid_packets]
         ))
 
-    # Legend at the very bottom, clean margins
     fig.update_layout(
-        xaxis_title="Elapsed Time (Minutes)",
+        xaxis_title="Elapsed Time in Window (Minutes)",
         yaxis_title="Surface Heave (Feet)",
         template="plotly_dark",
         height=450,
