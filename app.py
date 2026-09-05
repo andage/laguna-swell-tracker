@@ -9,8 +9,8 @@ st.set_page_config(page_title="lb surf", page_icon="🏄", layout="wide")
 
 # Active Southern California Stations
 STATIONS = {
-    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer", "lat": 33.221, "lon": -119.881},
-    "092 - San Pedro South": {"id": "092", "name": "San Pedro South", "lat": 33.618, "lon": -118.317},
+    "213 - San Pedro South": {"id": "213", "name": "San Pedro South", "lat": 33.584, "lon": -118.240},
+    "092 - San Pedro South (Legacy)": {"id": "092", "name": "San Pedro South (Legacy)", "lat": 33.618, "lon": -118.317},
     "045 - Oceanside Offshore": {"id": "045", "name": "Oceanside Offshore", "lat": 33.178, "lon": -117.472},
     "220 - Mission Bay West": {"id": "220", "name": "Mission Bay West", "lat": 32.749, "lon": -117.378},
     "100 - Torrey Pines Outer": {"id": "100", "name": "Torrey Pines Outer", "lat": 32.930, "lon": -117.392},
@@ -19,6 +19,7 @@ STATIONS = {
     "028 - San Pedro": {"id": "028", "name": "San Pedro (Outer Shelf)", "lat": 33.564, "lon": -118.477},
     "215 - Santa Monica Bay": {"id": "215", "name": "Santa Monica Bay", "lat": 33.855, "lon": -118.634},
     "111 - San Pedro Channel": {"id": "111", "name": "San Pedro Channel", "lat": 33.606, "lon": -118.318},
+    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer", "lat": 33.221, "lon": -119.881},
     "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf", "lat": 33.618, "lon": -118.317}
 }
 
@@ -32,12 +33,10 @@ def parse_epoch(val):
         v = float(val)
         if np.isnan(v) or np.isinf(v):
             return None
-        # Handle nanoseconds or milliseconds
         if v > 1e14:
             v /= 1e9
         elif v > 1e11:
             v /= 1e3
-        # Sanity check: valid epoch between years 2000 and 2035
         if 946684800 <= v <= 2051222400:
             return v
         return None
@@ -77,7 +76,6 @@ selected_end_epoch = None
 if time_mode == "Historical Lookback":
     c_hist1, c_hist2 = st.columns(2)
     with c_hist1:
-        # Default to 2 days ago (within active displacement buffer)
         default_date = (datetime.now(timezone.utc) - timedelta(days=2)).date()
         target_date = st.date_input("Target Date (UTC)", value=default_date)
     with c_hist2:
@@ -103,7 +101,6 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     hours = 4.0
     rt_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
     
-    # 1. Connect to Realtime Raw Displacement Buffer (decode_times=False prevents xarray timestamp parsing errors)
     try:
         ds = xr.open_dataset(rt_url, decode_times=False)
     except Exception as e:
@@ -123,7 +120,6 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     samples_needed = int(hours * 3600 * fs)
     total_len = len(ds.xyzZDisplacement)
 
-    # Robust start time parsing
     start_time_base = parse_epoch(ds.xyzStartTime.values) if "xyzStartTime" in ds else None
 
     if start_time_base is not None:
@@ -134,7 +130,6 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         start_time_base = file_end_epoch - (total_len / fs)
         range_desc = "Rolling Real-Time Buffer (~3–5 Days)"
 
-    # Determine whether requested time is inside the raw displacement buffer
     within_buffer = False
     if end_epoch is None:
         within_buffer = True
@@ -146,7 +141,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         idx_end = min(total_len, target_sample_index)
         idx_start = max(0, idx_end - samples_needed)
 
-    # --- EXECUTE 3D DISPLACEMENT ANALYSIS ---
+    # 1. 3D Displacement Analysis
     if within_buffer:
         try:
             z_raw = ds.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
@@ -163,7 +158,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         n_pts = len(z_raw)
         time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-        # Groundswell Processing
+        # Groundswell Decomposition
         b_gs, a_gs = butter(4, [1.0 / p_max, 1.0 / p_min], btype="band", fs=eff_fs)
         z_gs = filtfilt(b_gs, a_gs, z_raw)
         x_gs = filtfilt(b_gs, a_gs, x_raw)
@@ -201,16 +196,16 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
             else:
                 is_valid = angle_deg >= d_min or angle_deg <= d_max
 
-            gs_packets.append({
-                "index": p,
-                "time_min": time_min[p],
-                "height_ft": packet_height,
-                "direction": angle_deg,
-                "waves": wave_count,
-                "valid": is_valid
-            })
+        gs_packets.append({
+            "index": p,
+            "time_min": time_min[p],
+            "height_ft": packet_height,
+            "direction": angle_deg,
+            "waves": wave_count,
+            "valid": is_valid
+        })
 
-        # Windswell Processing
+        # Windswell Decomposition
         nyq = eff_fs / 2.0
         high_wind = min(1.0 / wp_min, nyq * 0.95)
         low_wind = 1.0 / wp_max
@@ -255,7 +250,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
             "file_range": range_desc
         }, None
 
-    # --- DEEP HISTORICAL ARCHIVE FALLBACK ---
+    # 2. Historical Archive Fallback
     hist_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_historic.nc"
     try:
         hds = xr.open_dataset(hist_url, decode_times=False)
@@ -309,7 +304,7 @@ else:
             avg_lull = min_lull = max_lull = avg_set_height = 0.0
             avg_dir = 205.0
 
-        # 1. Primary Metrics
+        # Primary Metrics
         st.subheader(f"🎯 Primary Groundswell — Buoy {station_id} ({station_name})")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Average Set Lull", f"{avg_lull:.1f} min" if avg_lull > 0 else "N/A")
@@ -318,7 +313,7 @@ else:
         delta_tag = "Historical Buffer Slice" if time_mode == "Historical Lookback" else "Past 4.0 Hours"
         m4.metric("Sets Detected", f"{len(valid_packets)} sets", delta=delta_tag, delta_color="normal")
 
-        # 2. Windswell Metrics
+        # Windswell Metrics
         st.subheader(f"💨 Background Windswell Chop — Buoy {station_id}")
         w1, w2, w3, w4 = st.columns(4)
         w1.metric("Chop Pulse Spacing", f"{wind['avg_interval_min']:.1f} min" if wind['avg_interval_min'] > 0 else "Continuous")
@@ -326,7 +321,7 @@ else:
         w3.metric("Peak Chop Spike", f"{wind['max_height_ft']:.1f} ft")
         w4.metric("Mean Chop Direction", f"{wind['avg_direction']:.0f}° True")
 
-        # 3. Groundswell Set Log Table
+        # Groundswell Set Log Table
         if valid_packets:
             st.subheader(f"📋 Groundswell Set Log for Buoy {station_id} ({station_name})")
             rows = []
@@ -344,7 +339,7 @@ else:
         else:
             st.info(f"No groundswell sets crossed the threshold within your directional window on Buoy {station_id} during this 4-hour window.")
 
-        # 4. Waveform & Envelope Analysis Plot
+        # Waveform & Envelope Plot
         st.subheader(f"📈 Waveform & Envelope Analysis — Buoy {station_id} ({station_name})")
         fig = go.Figure()
 
@@ -401,7 +396,6 @@ else:
         st.plotly_chart(fig, use_container_width=True)
 
     else:
-        # Archive Spectral Summary Mode (For dates older than ~5 days)
         st.warning(f"ℹ️ Selected date precedes the active raw displacement buffer ({data['buffer_span']}). Displaying CDIP Permanent Archive records for {data['target_dt']}.")
         
         avg_dir = data["dp_deg"]
