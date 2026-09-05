@@ -1,13 +1,39 @@
 import streamlit as st
 import numpy as np
 import xarray as xr
-from scipy.signal import butter, filtfilt, hilbert, find_peaks
+from scipy.signal import butter, filtfilt, hilbert, find_peaks, welch
 import plotly.graph_objects as go
 from datetime import datetime, time, timezone, timedelta
 
 st.set_page_config(page_title="lb surf", page_icon="🏄", layout="wide")
 
-# Active Southern California Stations
+# Condensed Mobile-Friendly Styling
+st.markdown("""
+<style>
+    .block-container { padding-top: 1rem !important; padding-bottom: 1.5rem !important; }
+    h1 { font-size: 1.4rem !important; margin: 0 0 0.2rem 0 !important; }
+    h2, h3 { font-size: 1.05rem !important; margin: 0.4rem 0 0.2rem 0 !important; }
+    div[data-testid="stMetric"] {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 6px 10px !important;
+        margin-bottom: 4px;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+        font-size: 0.72rem !important;
+        color: #8b949e !important;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        font-size: 1.05rem !important;
+        font-weight: 600 !important;
+        color: #f0f6fc !important;
+    }
+    .stTable { font-size: 0.8rem !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Station Catalog
 STATIONS = {
     "213 - San Pedro South": {"id": "213", "name": "San Pedro South", "lat": 33.584, "lon": -118.240},
     "092 - San Pedro South (Legacy)": {"id": "092", "name": "San Pedro South (Legacy)", "lat": 33.618, "lon": -118.317},
@@ -19,95 +45,56 @@ STATIONS = {
     "028 - San Pedro": {"id": "028", "name": "San Pedro (Outer Shelf)", "lat": 33.564, "lon": -118.477},
     "215 - Santa Monica Bay": {"id": "215", "name": "Santa Monica Bay", "lat": 33.855, "lon": -118.634},
     "111 - San Pedro Channel": {"id": "111", "name": "San Pedro Channel", "lat": 33.606, "lon": -118.318},
-    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer", "lat": 33.221, "lon": -119.881},
-    "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf", "lat": 33.618, "lon": -118.317}
+    "067 - San Nicolas Island": {"id": "067", "name": "San Nicolas Island Outer", "lat": 33.221, "lon": -119.881}
 }
-
-# --- Safe Timestamp Helpers ---
-def parse_epoch(val):
-    if val is None:
-        return None
-    try:
-        if hasattr(val, "item"):
-            val = val.item()
-        v = float(val)
-        if np.isnan(v) or np.isinf(v):
-            return None
-        if v > 1e14:
-            v /= 1e9
-        elif v > 1e11:
-            v /= 1e3
-        if 946684800 <= v <= 2051222400:
-            return v
-        return None
-    except Exception:
-        return None
-
-def format_utc(epoch):
-    v = parse_epoch(epoch)
-    if v is None:
-        return "Unknown"
-    try:
-        return datetime.fromtimestamp(v, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-    except Exception:
-        return "Unknown"
 
 # ------------------ TOP CONTROLS ------------------
 st.title("🏄 lb surf")
 
-c_top1, c_top2 = st.columns([2, 1])
+c_top1, c_top2 = st.columns([3, 1])
 with c_top1:
-    selected_label = st.selectbox("Select Buoy Station", list(STATIONS.keys()), index=0)
+    selected_label = st.selectbox("Buoy Station", list(STATIONS.keys()), index=0, label_visibility="collapsed")
     station_info = STATIONS[selected_label]
     station_id = station_info["id"]
     station_name = station_info["name"]
 with c_top2:
-    st.write("")
-    st.write("")
-    if st.button("🔄 Refresh Data / Clear Cache"):
+    if st.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-st.markdown(f"### Currently Monitoring: **Buoy {station_id} — {station_name}**")
-
-time_mode = st.selectbox("Time Window Mode", ["Live (Latest 4 Hours)", "Historical Lookback"], index=0)
+# Time Window Selection
+c_mode, c_date, c_time = st.columns([1.5, 1.2, 1])
+with c_mode:
+    time_mode = st.selectbox("Time Mode", ["Live (Latest 4h)", "Historical Lookback"], label_visibility="collapsed")
 
 selected_end_epoch = None
 if time_mode == "Historical Lookback":
-    c_hist1, c_hist2 = st.columns(2)
-    with c_hist1:
+    with c_date:
         default_date = (datetime.now(timezone.utc) - timedelta(days=2)).date()
-        target_date = st.date_input("Target Date (UTC)", value=default_date)
-    with c_hist2:
-        target_time = st.time_input("Target End Time (UTC)", value=time(12, 0))
+        target_date = st.date_input("Date", value=default_date, label_visibility="collapsed")
+    with c_time:
+        target_time = st.time_input("Time", value=time(12, 0), label_visibility="collapsed")
     dt_combined = datetime.combine(target_date, target_time).replace(tzinfo=timezone.utc)
     selected_end_epoch = int(dt_combined.timestamp())
-    st.info(f"Targeting window ending at: **{dt_combined.strftime('%Y-%m-%d %H:%M UTC')}**")
 
-# Swell Filter Settings
+# Directional Window (Brooks / Laguna Focus)
 with st.sidebar:
-    st.header("🎯 Groundswell Filter")
-    period_min = st.number_input("Min Groundswell Period (s)", 10.0, 25.0, 14.0, 1.0)
-    period_max = st.number_input("Max Groundswell Period (s)", 12.0, 30.0, 22.0, 1.0)
-    dir_min = st.number_input("Brooks Window Min (° True)", 0, 360, 190)
-    dir_max = st.number_input("Brooks Window Max (° True)", 0, 360, 220)
-
-    st.header("💨 Windswell Filter")
-    wind_p_min = st.number_input("Min Windchop Period (s)", 2.0, 8.0, 4.0, 0.5)
-    wind_p_max = st.number_input("Max Windchop Period (s)", 4.0, 12.0, 8.0, 0.5)
+    st.header("Laguna Target Window")
+    dir_min = st.number_input("Window Min (° True)", 0, 360, 160)
+    dir_max = st.number_input("Window Max (° True)", 0, 360, 230)
 
 @st.cache_data(ttl=900)
-def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_min, wp_max):
+def fetch_and_analyze(station, end_epoch, d_min, d_max):
     hours = 4.0
     rt_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
     
     try:
         ds = xr.open_dataset(rt_url, decode_times=False)
     except Exception as e:
-        return None, f"Could not connect to CDIP real-time endpoint for Station {station}: {e}"
+        return None, f"CDIP connection failed for Station {station}: {e}"
 
     if "xyzZDisplacement" not in ds or len(ds.xyzZDisplacement) == 0:
-        return None, f"Buoy {station} telemetry stream is currently empty or uncalibrated."
+        return None, f"Station {station} displacement stream currently offline."
 
     try:
         raw_fs = ds.xyzSampleRate.values.item() if hasattr(ds.xyzSampleRate.values, "item") else ds.xyzSampleRate.values
@@ -120,399 +107,264 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     samples_needed = int(hours * 3600 * fs)
     total_len = len(ds.xyzZDisplacement)
 
-    start_time_base = parse_epoch(ds.xyzStartTime.values) if "xyzStartTime" in ds else None
+    # Base Time & Window Slicing
+    start_time_base = None
+    if "xyzStartTime" in ds:
+        try:
+            val = float(ds.xyzStartTime.values)
+            if 946684800 <= val <= 2051222400:
+                start_time_base = val
+        except Exception:
+            pass
 
     if start_time_base is not None:
         file_end_epoch = start_time_base + (total_len / fs)
-        range_desc = f"{format_utc(start_time_base)} to {format_utc(file_end_epoch)}"
     else:
         file_end_epoch = datetime.now(timezone.utc).timestamp()
         start_time_base = file_end_epoch - (total_len / fs)
-        range_desc = "Rolling Real-Time Buffer (~3–5 Days)"
 
-    within_buffer = False
     if end_epoch is None:
-        within_buffer = True
         idx_start = max(0, total_len - samples_needed)
         idx_end = total_len
-    elif (start_time_base + (samples_needed / fs)) <= end_epoch <= (file_end_epoch + 3600):
-        within_buffer = True
-        target_sample_index = int((end_epoch - start_time_base) * fs)
-        idx_end = min(total_len, target_sample_index)
+    else:
+        target_idx = int((end_epoch - start_time_base) * fs)
+        idx_end = min(total_len, max(samples_needed, target_idx))
         idx_start = max(0, idx_end - samples_needed)
 
-    # 1. 3D Displacement Analysis
-    if within_buffer:
-        try:
-            z_raw = ds.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
-            x_raw = ds.xyzXDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
-            y_raw = ds.xyzYDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
-        except Exception as e:
-            return None, f"Error slicing displacement arrays: {e}"
-
-        fill_mask = (z_raw < -900) | (x_raw < -900) | (y_raw < -900)
-        z_raw[fill_mask] = 0.0
-        x_raw[fill_mask] = 0.0
-        y_raw[fill_mask] = 0.0
-
-        n_pts = len(z_raw)
-        time_min = np.arange(n_pts) / (eff_fs * 60.0)
-
-        # Groundswell Decomposition
-        b_gs, a_gs = butter(4, [1.0 / p_max, 1.0 / p_min], btype="band", fs=eff_fs)
-        z_gs = filtfilt(b_gs, a_gs, z_raw)
-        x_gs = filtfilt(b_gs, a_gs, x_raw)
-        y_gs = filtfilt(b_gs, a_gs, y_raw)
-
-        z_env_gs = np.abs(hilbert(z_gs))
-        smooth_win = int(eff_fs * 8.0)
-        if smooth_win > 1:
-            kernel = np.hanning(smooth_win)
-            kernel /= np.sum(kernel)
-            z_env_gs_smooth = np.convolve(z_env_gs, kernel, mode='same')
-        else:
-            z_env_gs_smooth = z_env_gs
-
-        min_dist_gs = int(70.0 * eff_fs)
-        thresh_gs = float(np.mean(z_env_gs) + 0.75 * np.std(z_env_gs))
-        peaks_gs, _ = find_peaks(z_env_gs, height=thresh_gs, distance=min_dist_gs)
-
-        gs_packets = []
-        for p in peaks_gs:
-            w = int(25.0 * eff_fs)
-            idx_s = max(0, p - w)
-            idx_e = min(n_pts, p + w)
-            
-            sub_peaks, _ = find_peaks(z_gs[idx_s:idx_e], distance=int(eff_fs * p_min * 0.7))
-            wave_count = max(len(sub_peaks), 1)
-
-            packet_height = (np.max(z_gs[idx_s:idx_e]) - np.min(z_gs[idx_s:idx_e])) * 3.28084
-            dx = np.mean(x_gs[idx_s:idx_e])
-            dy = np.mean(y_gs[idx_s:idx_e])
-            angle_deg = (np.degrees(np.arctan2(-dy, -dx)) + 360.0) % 360.0
-            
-            if d_min <= d_max:
-                is_valid = d_min <= angle_deg <= d_max
-            else:
-                is_valid = angle_deg >= d_min or angle_deg <= d_max
-
-        gs_packets.append({
-            "index": p,
-            "time_min": time_min[p],
-            "height_ft": packet_height,
-            "direction": angle_deg,
-            "waves": wave_count,
-            "valid": is_valid
-        })
-
-        # Windswell Decomposition
-        nyq = eff_fs / 2.0
-        high_wind = min(1.0 / wp_min, nyq * 0.95)
-        low_wind = 1.0 / wp_max
-        
-        b_ws, a_ws = butter(3, [low_wind, high_wind], btype="band", fs=eff_fs)
-        z_ws = filtfilt(b_ws, a_ws, z_raw)
-        x_ws = filtfilt(b_ws, a_ws, x_raw)
-        y_ws = filtfilt(b_ws, a_ws, y_raw)
-
-        z_env_ws = np.abs(hilbert(z_ws))
-        thresh_ws = float(np.mean(z_env_ws) + 0.6 * np.std(z_env_ws))
-        min_dist_ws = int(20.0 * eff_fs)
-        peaks_ws, _ = find_peaks(z_env_ws, height=thresh_ws, distance=min_dist_ws)
-
-        ws_heights, ws_dirs = [], []
-        for p in peaks_ws:
-            w = int(6.0 * eff_fs)
-            idx_s = max(0, p - w)
-            idx_e = min(n_pts, p + w)
-            h = (np.max(z_ws[idx_s:idx_e]) - np.min(z_ws[idx_s:idx_e])) * 3.28084
-            dx = np.mean(x_ws[idx_s:idx_e])
-            dy = np.mean(y_ws[idx_s:idx_e])
-            angle = (np.degrees(np.arctan2(-dy, -dx)) + 360.0) % 360.0
-            ws_heights.append(h)
-            ws_dirs.append(angle)
-
-        ws_intervals = [time_min[peaks_ws[i+1]] - time_min[peaks_ws[i]] for i in range(len(peaks_ws)-1)] if len(peaks_ws) > 1 else []
-
-        return {
-            "mode": "displacement",
-            "time_min": time_min,
-            "z_filt": z_gs * 3.28084,
-            "z_env_smooth": z_env_gs_smooth * 3.28084,
-            "threshold": thresh_gs * 3.28084,
-            "gs_packets": gs_packets,
-            "wind_summary": {
-                "avg_height_ft": np.mean(ws_heights) if ws_heights else 0.0,
-                "max_height_ft": np.max(ws_heights) if ws_heights else 0.0,
-                "avg_direction": np.mean(ws_dirs) if ws_dirs else 0.0,
-                "avg_interval_min": np.mean(ws_intervals) if ws_intervals else 0.0,
-            },
-            "file_range": range_desc
-        }, None
-
-    # 2. Historical Archive Fallback
-    hist_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_historic.nc"
     try:
-        hds = xr.open_dataset(hist_url, decode_times=False)
-    except Exception:
-        return None, f"Target date is outside the active 3–5 day raw displacement buffer ({range_desc}), and archive file is unreachable."
+        z_raw = ds.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+        x_raw = ds.xyzXDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+        y_raw = ds.xyzYDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+    except Exception as e:
+        return None, f"Data slicing error: {e}"
 
-    wave_times = hds.waveTime.values
-    t_idx = int(np.argmin(np.abs(wave_times - end_epoch)))
-    closest_epoch = float(wave_times[t_idx])
+    fill_mask = (z_raw < -900) | (x_raw < -900) | (y_raw < -900)
+    z_raw[fill_mask] = 0.0
+    x_raw[fill_mask] = 0.0
+    y_raw[fill_mask] = 0.0
 
-    if abs(closest_epoch - end_epoch) > (3600 * 24 * 30):
-        return None, f"Target date could not be located in CDIP's historical archive for Buoy {station}."
+    n_pts = len(z_raw)
+    time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-    hs = float(hds.waveHs[t_idx].values) * 3.28084
-    tp = float(hds.waveTp[t_idx].values)
-    dp = float(hds.waveDp[t_idx].values)
+    # 1. Spectral Analysis (Detect Dominant & Secondary Periods)
+    freqs, psd = welch(z_raw, fs=eff_fs, nperseg=min(len(z_raw), 1024))
+    valid_mask = (freqs >= 0.038) & (freqs <= 0.28) # 3.5s to 26s
+    f_band = freqs[valid_mask]
+    psd_band = psd[valid_mask]
+
+    peaks, _ = find_peaks(psd_band, distance=int(0.025 / (freqs[1] - freqs[0])))
+    if len(peaks) > 0:
+        sorted_p = peaks[np.argsort(psd_band[peaks])[::-1]]
+        f_dom = f_band[sorted_p[0]]
+        f_sec = f_band[sorted_p[1]] if len(sorted_p) > 1 else (0.17 if f_dom < 0.12 else 0.06)
+    else:
+        f_dom, f_sec = 0.075, 0.16 # Fallback: 13.3s and 6.2s
+
+    t_dom = 1.0 / f_dom
+    t_sec = 1.0 / f_sec
+
+    # 2. Decomposition Function
+    def decompose_band(f_center, bw=0.022):
+        low = max(0.035, f_center - bw)
+        high = min((eff_fs / 2.0) * 0.95, f_center + bw)
+        b, a = butter(3, [low, high], btype="band", fs=eff_fs)
+        z_f = filtfilt(b, a, z_raw)
+        x_f = filtfilt(b, a, x_raw)
+        y_f = filtfilt(b, a, y_raw)
+        env = np.abs(hilbert(z_f))
+        
+        # Envelope Smoothing
+        sm_len = int(eff_fs * 8.0)
+        kernel = np.hanning(sm_len)
+        kernel /= np.sum(kernel)
+        env_sm = np.convolve(env, kernel, mode="same")
+
+        thresh = float(np.mean(env) + 0.7 * np.std(env))
+        min_d = int((1.0 / f_center) * 3.5 * eff_fs)
+        p_idx, _ = find_peaks(env, height=thresh, distance=min_d)
+
+        pkts = []
+        for p in p_idx:
+            w = int((1.0 / f_center) * 1.5 * eff_fs)
+            s_i, e_i = max(0, p - w), min(n_pts, p + w)
+            h = (np.max(z_f[s_i:e_i]) - np.min(z_f[s_i:e_i])) * 3.28084
+            dx = np.mean(x_f[s_i:e_i])
+            dy = np.mean(y_f[s_i:e_i])
+            deg = (np.degrees(np.arctan2(-dy, -dx)) + 360.0) % 360.0
+            
+            sub_p, _ = find_peaks(z_f[s_i:e_i], distance=int(eff_fs * (1.0 / f_center) * 0.7))
+            waves = max(len(sub_p), 1)
+
+            valid = (d_min <= deg <= d_max) if d_min <= d_max else (deg >= d_min or deg <= d_max)
+            pkts.append({"time_min": time_min[p], "height_ft": h, "dir": deg, "waves": waves, "valid": valid})
+
+        return z_f * 3.28084, env_sm * 3.28084, thresh * 3.28084, pkts
+
+    z_dom_f, env_dom, thresh_dom, pkts_dom = decompose_band(f_dom, bw=0.02)
+    z_sec_f, env_sec, thresh_sec, pkts_sec = decompose_band(f_sec, bw=0.03)
 
     return {
-        "mode": "archive_spectral",
-        "hs_ft": hs,
-        "tp_s": tp,
-        "dp_deg": dp,
-        "target_dt": format_utc(closest_epoch),
-        "buffer_span": range_desc
+        "time_min": time_min,
+        "t_dom": t_dom,
+        "t_sec": t_sec,
+        "z_dom_f": z_dom_f,
+        "env_dom": env_dom,
+        "thresh_dom": thresh_dom,
+        "pkts_dom": pkts_dom,
+        "pkts_sec": pkts_sec
     }, None
 
-with st.spinner(f"Connecting to Buoy {station_id} ({station_name})..."):
-    data, err = fetch_and_process_cdip(station_id, selected_end_epoch, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
+with st.spinner("Processing dual-wave decomposition..."):
+    data, err = fetch_and_analyze(station_id, selected_end_epoch, dir_min, dir_max)
 
 if err:
     st.error(err)
 else:
-    if data["mode"] == "displacement":
-        all_packets = data["gs_packets"]
-        valid_packets = [p for p in all_packets if p["valid"]]
-        wind = data["wind_summary"]
-        st.caption(f"Active Real-Time Buffer: **{data['file_range']}**")
-
-        if len(valid_packets) > 1:
-            intervals = [valid_packets[i+1]["time_min"] - valid_packets[i]["time_min"] for i in range(len(valid_packets)-1)]
-            avg_lull = np.mean(intervals)
-            min_lull = np.min(intervals)
-            max_lull = np.max(intervals)
-            avg_set_height = np.mean([p["height_ft"] for p in valid_packets])
-            avg_dir = np.mean([p["direction"] for p in valid_packets])
-        elif len(valid_packets) == 1:
-            avg_lull = min_lull = max_lull = 0.0
-            avg_set_height = valid_packets[0]["height_ft"]
-            avg_dir = valid_packets[0]["direction"]
-        else:
-            avg_lull = min_lull = max_lull = avg_set_height = 0.0
-            avg_dir = 205.0
-
-        # Primary Metrics
-        st.subheader(f"🎯 Primary Groundswell — Buoy {station_id} ({station_name})")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Average Set Lull", f"{avg_lull:.1f} min" if avg_lull > 0 else "N/A")
-        m2.metric("Lull Range (Min / Max)", f"{min_lull:.1f} / {max_lull:.1f} min" if avg_lull > 0 else "N/A")
-        m3.metric("Deepwater Set Height", f"{avg_set_height:.1f} ft @ {avg_dir:.0f}°" if avg_set_height > 0 else "N/A")
-        delta_tag = "Historical Buffer Slice" if time_mode == "Historical Lookback" else "Past 4.0 Hours"
-        m4.metric("Sets Detected", f"{len(valid_packets)} sets", delta=delta_tag, delta_color="normal")
-
-        # Windswell Metrics
-        st.subheader(f"💨 Background Windswell Chop — Buoy {station_id}")
-        w1, w2, w3, w4 = st.columns(4)
-        w1.metric("Chop Pulse Spacing", f"{wind['avg_interval_min']:.1f} min" if wind['avg_interval_min'] > 0 else "Continuous")
-        w2.metric("Average Chop Height", f"{wind['avg_height_ft']:.1f} ft")
-        w3.metric("Peak Chop Spike", f"{wind['max_height_ft']:.1f} ft")
-        w4.metric("Mean Chop Direction", f"{wind['avg_direction']:.0f}° True")
-
-        # Groundswell Set Log Table
-        if valid_packets:
-            st.subheader(f"📋 Groundswell Set Log for Buoy {station_id} ({station_name})")
-            rows = []
-            for i, p in enumerate(valid_packets):
-                wait = f"{(p['time_min'] - valid_packets[i-1]['time_min']):.1f} min" if i > 0 else "—"
-                rows.append({
-                    "Set #": i + 1,
-                    "Arrival Time": f"+{p['time_min']:.1f} min",
-                    "Lull Duration": wait,
-                    "Offshore Height": f"{p['height_ft']:.2f} ft",
-                    "Waves in Packet": f"~{p['waves']} waves",
-                    "Direction": f"{p['direction']:.1f}° True"
-                })
-            st.table(rows)
-        else:
-            st.info(f"No groundswell sets crossed the threshold within your directional window on Buoy {station_id} during this 4-hour window.")
-
-        # Waveform & Envelope Plot
-        st.subheader(f"📈 Waveform & Envelope Analysis — Buoy {station_id} ({station_name})")
-        fig = go.Figure()
-
-        fig.add_trace(go.Scatter(
-            x=data["time_min"], 
-            y=data["z_filt"], 
-            mode="lines", 
-            name=f"Filtered Heave ({period_min:.0f}-{period_max:.0f}s)",
-            line=dict(color="rgba(41, 182, 246, 0.35)", width=1.0),
-            hoverinfo="skip"
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=data["time_min"], 
-            y=data["z_env_smooth"], 
-            mode="lines", 
-            name="Smoothed Wave Envelope",
-            line=dict(color="#ff9800", width=2.0)
-        ))
-
-        fig.add_hline(
-            y=data["threshold"], 
-            line=dict(color="#ef5350", dash="dot", width=1.2), 
-            annotation_text="Set Threshold",
-            annotation_position="bottom left"
-        )
-
-        if valid_packets:
-            fig.add_trace(go.Scatter(
-                x=[p["time_min"] for p in valid_packets],
-                y=[p["height_ft"]/2.0 for p in valid_packets],
-                mode="markers",
-                name=f"Target Set ({station_name})",
-                marker=dict(color="#00e676", size=10, symbol="diamond", line=dict(width=1, color="#ffffff")),
-                hovertemplate="<b>Set Packet</b><br>Time: +%{x:.1f} min<br>Height: %{customdata[0]:.2f} ft<br>Waves: ~%{customdata[1]} waves<br>Bearing: %{customdata[2]:.1f}° True<extra></extra>",
-                customdata=[[p["height_ft"], p["waves"], p["direction"]] for p in valid_packets]
-            ))
-
-        fig.update_layout(
-            xaxis_title="Elapsed Time in Window (Minutes)",
-            yaxis_title="Surface Heave (Feet)",
-            template="plotly_dark",
-            height=420,
-            margin=dict(l=20, r=20, t=20, b=10),
-            legend=dict(
-                orientation="h",
-                yanchor="top",
-                y=-0.25,
-                xanchor="center",
-                x=0.5,
-                font=dict(size=11)
-            )
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+    # Dominant Wave Metrics
+    p_dom = [p for p in data["pkts_dom"] if p["valid"]]
+    if len(p_dom) > 1:
+        lulls_dom = [p_dom[i+1]["time_min"] - p_dom[i]["time_min"] for i in range(len(p_dom)-1)]
+        avg_lull = np.mean(lulls_dom)
+        lull_str = f"{np.min(lulls_dom):.0f} / {np.max(lulls_dom):.0f}m"
+        h_dom = np.mean([p["height_ft"] for p in p_dom])
+        d_dom = np.mean([p["dir"] for p in p_dom])
+    elif len(p_dom) == 1:
+        avg_lull, lull_str = 0.0, "—"
+        h_dom, d_dom = p_dom[0]["height_ft"], p_dom[0]["dir"]
     else:
-        st.warning(f"ℹ️ Selected date precedes the active raw displacement buffer ({data['buffer_span']}). Displaying CDIP Permanent Archive records for {data['target_dt']}.")
-        
-        avg_dir = data["dp_deg"]
-        a1, a2, a3 = st.columns(3)
-        a1.metric("Significant Wave Height (Hs)", f"{data['hs_ft']:.1f} ft")
-        a2.metric("Peak Period (Tp)", f"{data['tp_s']:.1f} s")
-        a3.metric("Peak Direction (Dp)", f"{data['dp_deg']:.0f}° True")
+        avg_lull, lull_str, h_dom, d_dom = 0.0, "—", 0.0, 168.0
 
-    # 5. Southern California Swell Shadowing Map
-    st.subheader(f"🗺️ Southern California Swell Shadow Projection ({avg_dir:.0f}° True)")
+    # Secondary Wave Metrics
+    p_sec = data["pkts_sec"]
+    h_sec = np.mean([p["height_ft"] for p in p_sec]) if p_sec else 0.0
+    d_sec = np.mean([p["dir"] for p in p_sec]) if p_sec else 280.0
+    sec_type = "Groundswell" if data["t_sec"] >= 10.0 else "Windchop"
 
-    islands = {
-        "Catalina Island": [
-            (33.48, -118.60), (33.43, -118.50), (33.32, -118.32), 
-            (33.30, -118.35), (33.35, -118.52), (33.48, -118.60)
-        ],
-        "San Clemente Island": [
-            (33.03, -118.60), (32.95, -118.55), (32.81, -118.36),
-            (32.82, -118.42), (33.00, -118.62), (33.03, -118.60)
-        ],
-        "San Nicolas Island": [
-            (33.28, -119.58), (33.25, -119.45), (33.22, -119.48), 
-            (33.25, -119.59), (33.28, -119.58)
-        ]
-    }
+    # 1. Condensed Primary Metrics Row
+    st.markdown(f"**Dominant Swell ({data['t_dom']:.0f}s Component)**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Set Lull (Avg)", f"{avg_lull:.1f} min" if avg_lull > 0 else "—")
+    c2.metric("Lull Range", lull_str)
+    c3.metric("Deepwater Set", f"{h_dom:.1f}ft @ {d_dom:.0f}°" if h_dom > 0 else "—")
+    c4.metric("Sets (4h)", f"{len(p_dom)} sets")
 
-    shadow_angle_rad = np.radians((avg_dir - 180.0 + 360.0) % 360.0)
-    shadow_length = 0.9
-    d_lat = shadow_length * np.cos(shadow_angle_rad)
-    d_lon = shadow_length * np.sin(shadow_angle_rad)
+    # 2. Condensed Secondary Metrics Row
+    st.markdown(f"**Secondary Wave ({data['t_sec']:.0f}s {sec_type})**")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Pulse Spacing", f"{(240.0 / len(p_sec)):.1f} min" if len(p_sec) > 1 else "Continuous")
+    s2.metric("Component Ht", f"{h_sec:.1f} ft")
+    s3.metric("Direction", f"{d_sec:.0f}° True")
+    s4.metric("Band Peak", f"{data['t_sec']:.1f} sec")
 
+    # 3. Compact Set Table
+    if p_dom:
+        rows = []
+        for i, p in enumerate(p_dom):
+            wait = f"{(p['time_min'] - p_dom[i-1]['time_min']):.0f}m" if i > 0 else "—"
+            rows.append({
+                "Set": i + 1, "Time": f"+{p['time_min']:.0f}m", "Lull": wait,
+                "Set Ht": f"{p['height_ft']:.1f}ft", "Waves": f"~{p['waves']}", "Dir": f"{p['dir']:.0f}°"
+            })
+        st.table(rows[:8]) # Display top sets in compact format
+
+    # 4. Waveform & Envelope Analysis
+    st.markdown("**Dominant Wave Groups & Hilbert Envelope**")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=data["time_min"], y=data["z_dom_f"], mode="lines", name=f"{data['t_dom']:.0f}s Heave",
+        line=dict(color="rgba(41, 182, 246, 0.35)", width=1), hoverinfo="skip"
+    ))
+    fig.add_trace(go.Scatter(
+        x=data["time_min"], y=data["env_dom"], mode="lines", name="Envelope",
+        line=dict(color="#ff9800", width=1.8)
+    ))
+    fig.add_hline(y=data["thresh_dom"], line=dict(color="#ef5350", dash="dot", width=1))
+
+    if p_dom:
+        fig.add_trace(go.Scatter(
+            x=[p["time_min"] for p in p_dom], y=[p["height_ft"]/2.0 for p in p_dom],
+            mode="markers", name="Set",
+            marker=dict(color="#00e676", size=8, symbol="diamond")
+        ))
+
+    fig.update_layout(
+        template="plotly_dark", height=280,
+        margin=dict(l=10, r=10, t=10, b=30),
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center", font=dict(size=10))
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 5. Bulletproof Southern California Swell Shadowing Map
+    st.markdown(f"**SoCal Swell Shadow Projection ({d_dom:.0f}° True)**")
+    
     map_fig = go.Figure()
 
-    for name, coords in islands.items():
-        sh_lats = [pt[0] for pt in coords] + [pt[0] + d_lat for pt in reversed(coords)]
-        sh_lons = [pt[1] for pt in coords] + [pt[1] + d_lon for pt in reversed(coords)]
-        map_fig.add_trace(go.Scattergeo(
-            lat=sh_lats,
-            lon=sh_lons,
-            fill="toself",
-            fillcolor="rgba(239, 83, 80, 0.28)",
-            line=dict(color="rgba(239, 83, 80, 0.45)", width=1),
-            name=f"Shadow ({name})",
-            hoverinfo="text",
-            text=f"Blocked Zone behind {name}"
-        ))
-
-    for name, coords in islands.items():
-        map_fig.add_trace(go.Scattergeo(
-            lat=[pt[0] for pt in coords],
-            lon=[pt[1] for pt in coords],
-            fill="toself",
-            fillcolor="#546e7a",
-            line=dict(color="#b0bec5", width=1.5),
-            name=name,
-            hoverinfo="text",
-            text=name
-        ))
-
-    brooks_lat, brooks_lon = 33.535, -117.778
-    map_fig.add_trace(go.Scattergeo(
-        lat=[brooks_lat],
-        lon=[brooks_lon],
-        mode="markers+text",
-        marker=dict(size=11, color="#00e676", symbol="star"),
-        text=["Brooks St, Laguna Beach"],
-        textposition="top right",
-        name="Brooks Street (Laguna)",
-        hoverinfo="text"
+    # SoCal Coastline Geometry
+    coast_lat = [34.45, 34.41, 34.27, 34.02, 33.74, 33.74, 33.60, 33.535, 33.46, 33.19, 32.93, 32.67, 32.55]
+    coast_lon = [-120.47, -119.69, -119.29, -118.80, -118.40, -118.11, -117.88, -117.78, -117.70, -117.38, -117.26, -117.24, -117.13]
+    map_fig.add_trace(go.Scatter(
+        x=coast_lon, y=coast_lat, mode="lines", line=dict(color="#78909c", width=2),
+        name="Coastline", hoverinfo="skip"
     ))
 
-    map_fig.add_trace(go.Scattergeo(
-        lat=[station_info["lat"]],
-        lon=[station_info["lon"]],
-        mode="markers+text",
-        marker=dict(size=9, color="#29b6f6", symbol="circle"),
-        text=[f"Buoy {station_id}"],
-        textposition="bottom left",
-        name=f"Buoy {station_id} ({station_name})"
+    # Channel Islands Geometry
+    islands = {
+        "Catalina": [(33.48, -118.60), (33.43, -118.50), (33.32, -118.32), (33.30, -118.35), (33.35, -118.52), (33.48, -118.60)],
+        "San Clemente": [(33.03, -118.60), (32.95, -118.55), (32.81, -118.36), (32.82, -118.42), (33.00, -118.62), (33.03, -118.60)],
+        "San Nicolas": [(33.28, -119.58), (33.25, -119.45), (33.22, -119.48), (33.25, -119.59), (33.28, -119.58)]
+    }
+
+    # Shadow vectors downwave: traveling towards (d_dom + 180°)
+    sh_rad = np.radians((d_dom + 180.0) % 360.0)
+    sh_len = 1.15
+    d_lat = sh_len * np.cos(sh_rad)
+    d_lon = sh_len * np.sin(sh_rad)
+
+    # Project Shadow Cones
+    for name, pts in islands.items():
+        sh_x = [p[1] for p in pts] + [p[1] + d_lon for p in reversed(pts)]
+        sh_y = [p[0] for p in pts] + [p[0] + d_lat for p in reversed(pts)]
+        map_fig.add_trace(go.Scatter(
+            x=sh_x, y=sh_y, fill="toself", fillcolor="rgba(239, 83, 80, 0.3)",
+            line=dict(color="rgba(239, 83, 80, 0.4)", width=1), name=f"{name} Shadow", hoverinfo="skip"
+        ))
+
+    # Draw Islands
+    for name, pts in islands.items():
+        map_fig.add_trace(go.Scatter(
+            x=[p[1] for p in pts], y=[p[0] for p in pts], fill="toself", fillcolor="#455a64",
+            line=dict(color="#90a4ae", width=1.5), name=name, hoverinfo="text", text=name
+        ))
+
+    # Brooks Street
+    map_fig.add_trace(go.Scatter(
+        x=[-117.778], y=[33.535], mode="markers+text",
+        marker=dict(size=10, color="#00e676", symbol="star"),
+        text=["Brooks St"], textposition="top right", name="Brooks St"
     ))
 
-    arrow_lat = [32.4, 32.4 + 0.4 * np.cos(shadow_angle_rad)]
-    arrow_lon = [-118.9, -118.9 + 0.4 * np.sin(shadow_angle_rad)]
-    map_fig.add_trace(go.Scattergeo(
-        lat=arrow_lat,
-        lon=arrow_lon,
-        mode="lines+markers",
-        line=dict(color="#00e676", width=3),
-        marker=dict(size=[0, 8], symbol="triangle-up"),
-        name=f"Swell Approach Vector ({avg_dir:.0f}°)"
+    # Selected Buoy
+    map_fig.add_trace(go.Scatter(
+        x=[station_info["lon"]], y=[station_info["lat"]], mode="markers+text",
+        marker=dict(size=8, color="#29b6f6", symbol="circle"),
+        text=[f"Buoy {station_id}"], textposition="bottom center", name=f"Buoy {station_id}"
+    ))
+
+    # Swell Arrow Indicator
+    arr_x = [-118.8, -118.8 + 0.35 * np.sin(sh_rad)]
+    arr_y = [32.5, 32.5 + 0.35 * np.cos(sh_rad)]
+    map_fig.add_trace(go.Scatter(
+        x=arr_x, y=arr_y, mode="lines+markers",
+        line=dict(color="#00e676", width=2.5), marker=dict(size=[0, 8], symbol="triangle-up"),
+        name=f"Swell Track ({d_dom:.0f}°)"
     ))
 
     map_fig.update_layout(
-        geo=dict(
-            scope="usa",
-            projection_type="mercator",
-            center=dict(lat=33.35, lon=-118.4),
-            lataxis=dict(range=[32.3, 34.1]),
-            lonaxis=dict(range=[-120.2, -117.0]),
-            showland=True,
-            landcolor="#1e222d",
-            showocean=True,
-            oceancolor="#0f131a",
-            showcoastlines=True,
-            coastlinecolor="#78909c",
-            resolution=50
-        ),
-        height=520,
-        margin=dict(l=10, r=10, t=10, b=10),
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.05,
-            xanchor="center",
-            x=0.5,
-            font=dict(size=10)
-        )
+        template="plotly_dark", height=380,
+        plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+        xaxis=dict(range=[-120.2, -117.0], showgrid=True, gridcolor="#21262d", zeroline=False),
+        yaxis=dict(range=[32.4, 34.6], showgrid=True, gridcolor="#21262d", scaleanchor="x", scaleratio=1.19, zeroline=False),
+        margin=dict(l=10, r=10, t=10, b=30),
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center", font=dict(size=9))
     )
-
     st.plotly_chart(map_fig, use_container_width=True)
