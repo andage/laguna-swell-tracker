@@ -22,6 +22,37 @@ STATIONS = {
     "222 - San Pedro South Shelf": {"id": "222", "name": "San Pedro South Shelf", "lat": 33.618, "lon": -118.317}
 }
 
+# --- Safe Timestamp Helpers ---
+def parse_epoch(val):
+    if val is None:
+        return None
+    try:
+        if hasattr(val, "item"):
+            val = val.item()
+        v = float(val)
+        if np.isnan(v) or np.isinf(v):
+            return None
+        # Handle nanoseconds or milliseconds
+        if v > 1e14:
+            v /= 1e9
+        elif v > 1e11:
+            v /= 1e3
+        # Sanity check: valid epoch between years 2000 and 2035
+        if 946684800 <= v <= 2051222400:
+            return v
+        return None
+    except Exception:
+        return None
+
+def format_utc(epoch):
+    v = parse_epoch(epoch)
+    if v is None:
+        return "Unknown"
+    try:
+        return datetime.fromtimestamp(v, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    except Exception:
+        return "Unknown"
+
 # ------------------ TOP CONTROLS ------------------
 st.title("🏄 lb surf")
 
@@ -46,7 +77,7 @@ selected_end_epoch = None
 if time_mode == "Historical Lookback":
     c_hist1, c_hist2 = st.columns(2)
     with c_hist1:
-        # Default to 2 days ago to guarantee buffer hit
+        # Default to 2 days ago (within active displacement buffer)
         default_date = (datetime.now(timezone.utc) - timedelta(days=2)).date()
         target_date = st.date_input("Target Date (UTC)", value=default_date)
     with c_hist2:
@@ -72,40 +103,50 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
     hours = 4.0
     rt_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
     
-    # Check realtime displacement buffer
+    # 1. Connect to Realtime Raw Displacement Buffer (decode_times=False prevents xarray timestamp parsing errors)
     try:
-        ds = xr.open_dataset(rt_url)
+        ds = xr.open_dataset(rt_url, decode_times=False)
     except Exception as e:
         return None, f"Could not connect to CDIP real-time endpoint for Station {station}: {e}"
 
-    fs = float(ds.xyzSampleRate.values) if "xyzSampleRate" in ds else 1.28
+    if "xyzZDisplacement" not in ds or len(ds.xyzZDisplacement) == 0:
+        return None, f"Buoy {station} telemetry stream is currently empty or uncalibrated."
+
+    try:
+        raw_fs = ds.xyzSampleRate.values.item() if hasattr(ds.xyzSampleRate.values, "item") else ds.xyzSampleRate.values
+        fs = float(raw_fs)
+    except Exception:
+        fs = 1.28
+
     stride = 2
     eff_fs = fs / stride
     samples_needed = int(hours * 3600 * fs)
     total_len = len(ds.xyzZDisplacement)
 
-    start_time_base = float(ds.xyzStartTime.values) if "xyzStartTime" in ds else None
+    # Robust start time parsing
+    start_time_base = parse_epoch(ds.xyzStartTime.values) if "xyzStartTime" in ds else None
+
     if start_time_base is not None:
         file_end_epoch = start_time_base + (total_len / fs)
-        dt_start_str = datetime.fromtimestamp(start_time_base, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-        dt_end_str = datetime.fromtimestamp(file_end_epoch, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-        range_desc = f"{dt_start_str} to {dt_end_str}"
+        range_desc = f"{format_utc(start_time_base)} to {format_utc(file_end_epoch)}"
     else:
         file_end_epoch = datetime.now(timezone.utc).timestamp()
-        range_desc = "Recent 3-5 days buffer"
+        start_time_base = file_end_epoch - (total_len / fs)
+        range_desc = "Rolling Real-Time Buffer (~3–5 Days)"
 
-    # --- Case 1: Real-Time or within Buffer ---
+    # Determine whether requested time is inside the raw displacement buffer
     within_buffer = False
     if end_epoch is None:
         within_buffer = True
         idx_start = max(0, total_len - samples_needed)
         idx_end = total_len
-    elif start_time_base is not None and (start_time_base + samples_needed/fs) <= end_epoch <= (file_end_epoch + 3600):
+    elif (start_time_base + (samples_needed / fs)) <= end_epoch <= (file_end_epoch + 3600):
         within_buffer = True
         target_sample_index = int((end_epoch - start_time_base) * fs)
         idx_end = min(total_len, target_sample_index)
         idx_start = max(0, idx_end - samples_needed)
 
+    # --- EXECUTE 3D DISPLACEMENT ANALYSIS ---
     if within_buffer:
         try:
             z_raw = ds.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
@@ -122,7 +163,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         n_pts = len(z_raw)
         time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-        # 1. Groundswell Processing
+        # Groundswell Processing
         b_gs, a_gs = butter(4, [1.0 / p_max, 1.0 / p_min], btype="band", fs=eff_fs)
         z_gs = filtfilt(b_gs, a_gs, z_raw)
         x_gs = filtfilt(b_gs, a_gs, x_raw)
@@ -169,7 +210,7 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
                 "valid": is_valid
             })
 
-        # 2. Windswell Processing
+        # Windswell Processing
         nyq = eff_fs / 2.0
         high_wind = min(1.0 / wp_min, nyq * 0.95)
         low_wind = 1.0 / wp_max
@@ -214,20 +255,19 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
             "file_range": range_desc
         }, None
 
-    # --- Case 2: Deep Historical Archive (Fallback to Processed Spectral Timeseries) ---
+    # --- DEEP HISTORICAL ARCHIVE FALLBACK ---
     hist_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/archive/{station}p1/{station}p1_historic.nc"
     try:
-        hds = xr.open_dataset(hist_url)
+        hds = xr.open_dataset(hist_url, decode_times=False)
     except Exception:
-        return None, f"Target date is outside the 3-day raw buffer (**{range_desc}**), and historical archive file is unavailable."
+        return None, f"Target date is outside the active 3–5 day raw displacement buffer ({range_desc}), and archive file is unreachable."
 
-    # Look up nearest waveTime index
     wave_times = hds.waveTime.values
-    t_idx = np.argmin(np.abs(wave_times - end_epoch))
-    
-    closest_epoch = wave_times[t_idx]
-    if abs(closest_epoch - end_epoch) > 3600 * 24 * 7: # Over 7 days mismatch
-        return None, f"Target date could not be found in historical archive for Station {station}."
+    t_idx = int(np.argmin(np.abs(wave_times - end_epoch)))
+    closest_epoch = float(wave_times[t_idx])
+
+    if abs(closest_epoch - end_epoch) > (3600 * 24 * 30):
+        return None, f"Target date could not be located in CDIP's historical archive for Buoy {station}."
 
     hs = float(hds.waveHs[t_idx].values) * 3.28084
     tp = float(hds.waveTp[t_idx].values)
@@ -238,11 +278,11 @@ def fetch_and_process_cdip(station, end_epoch, p_min, p_max, d_min, d_max, wp_mi
         "hs_ft": hs,
         "tp_s": tp,
         "dp_deg": dp,
-        "target_dt": datetime.fromtimestamp(closest_epoch, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+        "target_dt": format_utc(closest_epoch),
         "buffer_span": range_desc
     }, None
 
-with st.spinner(f"Querying wave telemetry from Buoy {station_id}..."):
+with st.spinner(f"Connecting to Buoy {station_id} ({station_name})..."):
     data, err = fetch_and_process_cdip(station_id, selected_end_epoch, period_min, period_max, dir_min, dir_max, wind_p_min, wind_p_max)
 
 if err:
@@ -252,7 +292,7 @@ else:
         all_packets = data["gs_packets"]
         valid_packets = [p for p in all_packets if p["valid"]]
         wind = data["wind_summary"]
-        st.caption(f"Active Real-Time Buffer Span: **{data['file_range']}**")
+        st.caption(f"Active Real-Time Buffer: **{data['file_range']}**")
 
         if len(valid_packets) > 1:
             intervals = [valid_packets[i+1]["time_min"] - valid_packets[i]["time_min"] for i in range(len(valid_packets)-1)]
@@ -362,7 +402,7 @@ else:
 
     else:
         # Archive Spectral Summary Mode (For dates older than ~5 days)
-        st.warning(f"ℹ️ Selected date precedes the active 3-5 day raw displacement buffer ({data['buffer_span']}). Showing CDIP Permanent Archive Spectral Records for {data['target_dt']}.")
+        st.warning(f"ℹ️ Selected date precedes the active raw displacement buffer ({data['buffer_span']}). Displaying CDIP Permanent Archive records for {data['target_dt']}.")
         
         avg_dir = data["dp_deg"]
         a1, a2, a3 = st.columns(3)
