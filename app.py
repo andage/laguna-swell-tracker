@@ -77,27 +77,29 @@ if time_mode == "Historical Lookback":
     dt_combined = datetime.combine(target_date, target_time).replace(tzinfo=timezone.utc)
     selected_end_epoch = int(dt_combined.timestamp())
 
-# Directional Window (Brooks / Laguna Focus)
-with st.sidebar:
-    st.header("Laguna Target Window")
-    dir_min = st.number_input("Window Min (° True)", 0, 360, 160)
-    dir_max = st.number_input("Window Max (° True)", 0, 360, 230)
-
 @st.cache_data(ttl=900)
-def fetch_and_analyze(station, end_epoch, d_min, d_max):
+def fetch_and_analyze(station, end_epoch):
     hours = 4.0
-    rt_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
+    rt_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_rt.nc"
+    xy_url = f"http://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/realtime/{station}p1_xy.nc"
     
     try:
-        ds = xr.open_dataset(rt_url, decode_times=False)
+        ds_rt = xr.open_dataset(rt_url, decode_times=False)
+        ds_xy = xr.open_dataset(xy_url, decode_times=False)
     except Exception as e:
         return None, f"CDIP connection failed for Station {station}: {e}"
 
-    if "xyzZDisplacement" not in ds or len(ds.xyzZDisplacement) == 0:
+    if "xyzZDisplacement" not in ds_xy or len(ds_xy.xyzZDisplacement) == 0:
         return None, f"Station {station} displacement stream currently offline."
 
+    # Pull Official CDIP Dominant Period
     try:
-        raw_fs = ds.xyzSampleRate.values.item() if hasattr(ds.xyzSampleRate.values, "item") else ds.xyzSampleRate.values
+        cdip_tp = float(ds_rt.waveTp[-1].values)
+    except Exception:
+        cdip_tp = 14.0 # Fallback
+
+    try:
+        raw_fs = ds_xy.xyzSampleRate.values.item() if hasattr(ds_xy.xyzSampleRate.values, "item") else ds_xy.xyzSampleRate.values
         fs = float(raw_fs)
     except Exception:
         fs = 1.28
@@ -105,13 +107,12 @@ def fetch_and_analyze(station, end_epoch, d_min, d_max):
     stride = 2
     eff_fs = fs / stride
     samples_needed = int(hours * 3600 * fs)
-    total_len = len(ds.xyzZDisplacement)
+    total_len = len(ds_xy.xyzZDisplacement)
 
-    # Base Time & Window Slicing
     start_time_base = None
-    if "xyzStartTime" in ds:
+    if "xyzStartTime" in ds_xy:
         try:
-            val = float(ds.xyzStartTime.values)
+            val = float(ds_xy.xyzStartTime.values)
             if 946684800 <= val <= 2051222400:
                 start_time_base = val
         except Exception:
@@ -132,9 +133,9 @@ def fetch_and_analyze(station, end_epoch, d_min, d_max):
         idx_start = max(0, idx_end - samples_needed)
 
     try:
-        z_raw = ds.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
-        x_raw = ds.xyzXDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
-        y_raw = ds.xyzYDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+        z_raw = ds_xy.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+        x_raw = ds_xy.xyzXDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
+        y_raw = ds_xy.xyzYDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
     except Exception as e:
         return None, f"Data slicing error: {e}"
 
@@ -146,21 +147,25 @@ def fetch_and_analyze(station, end_epoch, d_min, d_max):
     n_pts = len(z_raw)
     time_min = np.arange(n_pts) / (eff_fs * 60.0)
 
-    # 1. Spectral Analysis (Detect Dominant & Secondary Periods)
+    # Spectral Analysis for Secondary Period
     freqs, psd = welch(z_raw, fs=eff_fs, nperseg=min(len(z_raw), 1024))
-    valid_mask = (freqs >= 0.038) & (freqs <= 0.28) # 3.5s to 26s
+    valid_mask = (freqs >= 0.038) & (freqs <= 0.28)
     f_band = freqs[valid_mask]
     psd_band = psd[valid_mask]
 
     peaks, _ = find_peaks(psd_band, distance=int(0.025 / (freqs[1] - freqs[0])))
+    
+    f_dom = 1.0 / cdip_tp
+    f_sec = 0.16 # Fallback 6.2s
     if len(peaks) > 0:
         sorted_p = peaks[np.argsort(psd_band[peaks])[::-1]]
-        f_dom = f_band[sorted_p[0]]
-        f_sec = f_band[sorted_p[1]] if len(sorted_p) > 1 else (0.17 if f_dom < 0.12 else 0.06)
-    else:
-        f_dom, f_sec = 0.075, 0.16 # Fallback: 13.3s and 6.2s
+        for p_idx in sorted_p:
+            peak_f = f_band[p_idx]
+            # Find the strongest spectral peak that is significantly different from the CDIP Tp
+            if abs(peak_f - f_dom) > 0.03:
+                f_sec = peak_f
+                break
 
-    t_dom = 1.0 / f_dom
     t_sec = 1.0 / f_sec
 
     # 2. Decomposition Function
@@ -173,7 +178,6 @@ def fetch_and_analyze(station, end_epoch, d_min, d_max):
         y_f = filtfilt(b, a, y_raw)
         env = np.abs(hilbert(z_f))
         
-        # Envelope Smoothing
         sm_len = int(eff_fs * 8.0)
         kernel = np.hanning(sm_len)
         kernel /= np.sum(kernel)
@@ -195,17 +199,16 @@ def fetch_and_analyze(station, end_epoch, d_min, d_max):
             sub_p, _ = find_peaks(z_f[s_i:e_i], distance=int(eff_fs * (1.0 / f_center) * 0.7))
             waves = max(len(sub_p), 1)
 
-            valid = (d_min <= deg <= d_max) if d_min <= d_max else (deg >= d_min or deg <= d_max)
-            pkts.append({"time_min": time_min[p], "height_ft": h, "dir": deg, "waves": waves, "valid": valid})
+            pkts.append({"time_min": time_min[p], "height_ft": h, "dir": deg, "waves": waves})
 
         return z_f * 3.28084, env_sm * 3.28084, thresh * 3.28084, pkts
 
-    z_dom_f, env_dom, thresh_dom, pkts_dom = decompose_band(f_dom, bw=0.02)
-    z_sec_f, env_sec, thresh_sec, pkts_sec = decompose_band(f_sec, bw=0.03)
+    z_dom_f, env_dom, thresh_dom, pkts_dom = decompose_band(f_dom, bw=0.025)
+    z_sec_f, env_sec, thresh_sec, pkts_sec = decompose_band(f_sec, bw=0.035)
 
     return {
         "time_min": time_min,
-        "t_dom": t_dom,
+        "t_dom": cdip_tp,
         "t_sec": t_sec,
         "z_dom_f": z_dom_f,
         "env_dom": env_dom,
@@ -215,13 +218,13 @@ def fetch_and_analyze(station, end_epoch, d_min, d_max):
     }, None
 
 with st.spinner("Processing dual-wave decomposition..."):
-    data, err = fetch_and_analyze(station_id, selected_end_epoch, dir_min, dir_max)
+    data, err = fetch_and_analyze(station_id, selected_end_epoch)
 
 if err:
     st.error(err)
 else:
     # Dominant Wave Metrics
-    p_dom = [p for p in data["pkts_dom"] if p["valid"]]
+    p_dom = data["pkts_dom"]
     if len(p_dom) > 1:
         lulls_dom = [p_dom[i+1]["time_min"] - p_dom[i]["time_min"] for i in range(len(p_dom)-1)]
         avg_lull = np.mean(lulls_dom)
@@ -265,7 +268,7 @@ else:
                 "Set": i + 1, "Time": f"+{p['time_min']:.0f}m", "Lull": wait,
                 "Set Ht": f"{p['height_ft']:.1f}ft", "Waves": f"~{p['waves']}", "Dir": f"{p['dir']:.0f}°"
             })
-        st.table(rows[:8]) # Display top sets in compact format
+        st.table(rows[:8]) # Display top 8 sets in compact format
 
     # 4. Waveform & Envelope Analysis
     st.markdown("**Dominant Wave Groups & Hilbert Envelope**")
