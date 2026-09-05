@@ -11,7 +11,7 @@ st.set_page_config(page_title="lb surf", page_icon="🏄", layout="wide")
 st.markdown("""
 <style>
     .block-container { padding-top: 1rem !important; padding-bottom: 1.5rem !important; max-width: 100%; }
-    h1 { font-size: 1.2rem !important; margin: 0 0 0.2rem 0 !important; }
+    h1 { font-size: 1.3rem !important; margin: 0 0 0.2rem 0 !important; }
     h3 { font-size: 0.95rem !important; margin: 0.2rem 0 0.2rem 0 !important; font-weight: 600; color: #58a6ff; }
     div[data-testid="stMetric"] {
         background-color: #161b22;
@@ -41,19 +41,25 @@ STATIONS = {
 }
 
 # ------------------ TOP CONTROLS ------------------
+st.title("🏄 lb surf")
+
 c_top1, c_top2 = st.columns([3, 1])
 with c_top1:
-    selected_label = st.selectbox("Buoy Station", list(STATIONS.keys()), index=0, label_visibility="collapsed")
+    selected_label = st.selectbox("Select Buoy Station", list(STATIONS.keys()), index=0)
     station_info = STATIONS[selected_label]
     station_id = station_info["id"]
+    station_name = station_info["name"]
 with c_top2:
+    st.write("")
     if st.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
+st.markdown(f"### Currently Monitoring: **Buoy {station_id} — {station_name}**")
+
 c_mode, c_date, c_time = st.columns([1.5, 1.2, 1])
 with c_mode:
-    time_mode = st.selectbox("Mode", ["Live (Latest 4h)", "Historical Lookback"], label_visibility="collapsed")
+    time_mode = st.selectbox("Mode", ["Live (Latest 4h)", "Historical Lookback"])
 
 selected_end_epoch = None
 if time_mode == "Historical Lookback":
@@ -134,7 +140,6 @@ def fetch_and_analyze(station, end_epoch):
     idx_start = max(0, idx_end - samples_needed)
 
     try:
-        # Load Z (Heave) only - massive memory savings & prevents dx/dy direction math errors
         z_raw = ds_xy.xyzZDisplacement[idx_start:idx_end:stride].values.astype(np.float64)
     except Exception as e:
         return None, f"Slicing error: {e}"
